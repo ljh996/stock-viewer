@@ -425,12 +425,23 @@ app.get('/api/limit-up/today', async (req, res) => {
     console.log('Python 涨停服务不可用，降级到新浪:', e.message)
   }
 
-  // 降级：用新浪接口筛选涨停股
+  // 优先用东方财富专门的涨停API（数据更全）
+  try {
+    const today = new Date().toISOString().slice(0, 10)
+    const eastStocks = await getLimitUpByDate(today)
+    if (eastStocks.length > 0) {
+      return res.json({ success: true, data: eastStocks })
+    }
+  } catch (e) {
+    console.log('东方财富涨停接口失败:', e.message)
+  }
+
+  // 降级：用新浪接口筛选涨停股（扩大取数范围，避免截断）
   let stocks = []
   try {
     const { ok: ok2, body: body2 } = await httpGetWithTimeout(
-      'https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=80&sort=changepercent&asc=0&node=hs_a&symbol=&_s_r_a=page',
-      { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 10000
+      'https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=5000&sort=changepercent&asc=0&node=hs_a&symbol=&_s_r_a=page',
+      { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 15000
     )
     if (ok2) {
       let data
@@ -454,16 +465,6 @@ app.get('/api/limit-up/today', async (req, res) => {
     }
   } catch (e) {
     console.log('新浪接口降级失败:', e.message)
-  }
-
-  // 最后尝试东方财富
-  if (stocks.length === 0) {
-    try {
-      const today = new Date().toISOString().slice(0, 10)
-      stocks = await getLimitUpByDate(today)
-    } catch (e) {
-      console.log('东方财富接口也失败:', e.message)
-    }
   }
 
   res.json({ success: true, data: stocks })
@@ -525,9 +526,11 @@ app.get('/api/limit-up/stats', async (req, res) => {
     const groups = {}
     for (const s of stocks) {
       const key = s.price < 10 ? '低价股 (<10元)' : s.price < 30 ? '中价股 (10-30元)' : '高价股 (>30元)'
-      groups[key] = (groups[key] || 0) + 1
+      if (!groups[key]) groups[key] = { industry: key, count: 0, stocks: [] }
+      groups[key].count++
+      groups[key].stocks.push(s)
     }
-    const stats = Object.entries(groups).map(([industry, count]) => ({ industry, count }))
+    const stats = Object.values(groups)
     return res.json({ success: true, data: stats })
   } catch (e) {
     console.log('涨停统计降级失败:', e.message)
@@ -535,6 +538,109 @@ app.get('/api/limit-up/stats', async (req, res) => {
 
   res.json({ success: true, data: [] })
 })
+
+// ==================== DeepSeek AI 分析 ====================
+
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
+
+app.get('/api/limit-up/analysis', async (req, res) => {
+  try {
+    // 获取当天涨停数据
+    let stocks = []
+    try {
+      stocks = await getTodayLimitUp()
+    } catch { /* ignore */ }
+
+    if (stocks.length === 0) {
+      try {
+        const today = new Date().toISOString().slice(0, 10)
+        stocks = await getLimitUpByDate(today)
+      } catch { /* ignore */ }
+    }
+
+    if (stocks.length === 0) {
+      return res.json({ success: false, error: '暂无涨停数据，无法进行分析' })
+    }
+
+    // 汇总信息
+    const lowPrice = stocks.filter(s => s.price < 10)
+    const midPrice = stocks.filter(s => s.price >= 10 && s.price < 30)
+    const highPrice = stocks.filter(s => s.price >= 30)
+
+    const topStocks = stocks.slice(0, 30).map((s, i) =>
+      `${i+1}. ${s.name}(${s.symbol}) 涨幅${s.change_percent}% 价格${s.price}元 换手${s.turnover_rate}%`
+    ).join('\n')
+
+    const prompt = `你是一位A股资深市场分析师。请对今天A股涨停情况进行专业分析。
+
+【今日涨停概况】
+- 涨停总数：${stocks.length}只
+- 低价股（<10元）：${lowPrice.length}只
+- 中价股（10-30元）：${midPrice.length}只
+- 高价股（>30元）：${highPrice.length}只
+
+【涨停个股明细（前30只）】
+${topStocks}
+
+请从以下角度进行分析：
+1. 市场情绪判断：今日涨停数量反映什么市场情绪？是强势、中性还是弱势？
+2. 资金偏好：资金更倾向于低价股、中价股还是高价股？这说明什么？
+3. 操作建议：基于当前情况，对短线和中线投资者分别给出建议
+4. 风险提示：当前市场需要关注哪些风险因素？
+
+请用中文回答，保持专业客观，控制在500字以内。`
+
+    const response = await httpsPost(
+      'https://api.deepseek.com/v1/chat/completions',
+      {
+        model: 'deepseek-chat',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.7,
+        max_tokens: 1500,
+      },
+      { 'Authorization': `Bearer ${DEEPSEEK_API_KEY}` }
+    )
+
+    if (response.choices && response.choices.length > 0) {
+      const analysis = response.choices[0].message.content
+      return res.json({ success: true, data: analysis })
+    }
+    res.json({ success: false, error: 'DeepSeek API 返回异常' })
+  } catch (err) {
+    console.error('DeepSeek 分析失败:', err.message)
+    res.status(500).json({ success: false, error: `AI分析失败: ${err.message}` })
+  }
+})
+
+// HTTPS POST 请求（用于调用 DeepSeek API）
+function httpsPost(urlStr, data, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlStr)
+    const body = JSON.stringify(data)
+    const options = {
+      hostname: url.hostname,
+      port: 443,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        ...headers,
+      },
+    }
+    const req = https.request(options, (res) => {
+      let responseBody = ''
+      res.on('data', chunk => responseBody += chunk)
+      res.on('end', () => {
+        try { resolve(JSON.parse(responseBody)) }
+        catch { reject(new Error('JSON解析失败')) }
+      })
+    })
+    req.on('error', reject)
+    req.write(body)
+    req.end()
+  })
+}
 
 // 同步状态
 app.get('/api/sync/status', async (req, res) => {
@@ -550,11 +656,18 @@ app.get('/api/sync/status', async (req, res) => {
 })
 
 async function getTodayLimitUp() {
+  // 优先用东方财富专门的涨停API
+  try {
+    const today = new Date().toISOString().slice(0, 10)
+    const eastStocks = await getLimitUpByDate(today)
+    if (eastStocks.length > 0) return eastStocks
+  } catch { /* ignore */ }
+
   let stocks = []
   try {
     const { ok, body } = await httpGetWithTimeout(
-      'https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=80&sort=changepercent&asc=0&node=hs_a&symbol=&_s_r_a=page',
-      { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 10000
+      'https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=5000&sort=changepercent&asc=0&node=hs_a&symbol=&_s_r_a=page',
+      { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 15000
     )
     if (ok) {
       let data
@@ -606,8 +719,8 @@ async function getLimitUpByDate(dateStr) {
   if (stocks.length === 0) {
     try {
       const { ok, body } = await httpGetWithTimeout(
-        'https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=80&sort=changepercent&asc=0&node=hs_a&symbol=&_s_r_a=page',
-        { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 10000
+        'https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=5000&sort=changepercent&asc=0&node=hs_a&symbol=&_s_r_a=page',
+        { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 15000
       )
       if (ok) {
         let data

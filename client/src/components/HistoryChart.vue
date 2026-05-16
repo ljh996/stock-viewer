@@ -29,8 +29,15 @@
         <!-- Area fill -->
         <path :d="areaPath" :fill="fillColor" />
 
-        <!-- Line -->
-        <path :d="linePath" fill="none" :stroke="lineColor" stroke-width="2" stroke-linejoin="round" />
+        <!-- Line with glow -->
+        <defs>
+          <filter id="line-glow">
+            <feGaussianBlur stdDeviation="2" result="blur"/>
+            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+        <path :d="linePath" fill="none" :stroke="lineColor" stroke-width="2.5" stroke-linejoin="round" filter="url(#line-glow)" />
+        <path :d="linePath" fill="none" :stroke="lineColor" stroke-width="1" stroke-linejoin="round" opacity="0.5" />
 
         <!-- Data points + date labels -->
         <g v-for="(pt, i) in points" :key="'pt-' + i">

@@ -7,6 +7,9 @@
         <span>股票行情查看器</span>
       </div>
       <span class="header-badge">Vue3 + Express</span>
+      <button class="theme-toggle" @click="toggleTheme" :title="isDark ? '切换简约白' : '切换科技风'">
+        {{ isDark ? '☀️' : '🌙' }}
+      </button>
     </header>
 
     <!-- Top Tab Bar -->
@@ -27,7 +30,8 @@
 
     <main class="main-container">
       <!-- ==================== Tab 1: 行情查询 ==================== -->
-      <div v-show="activeTab === 'quote'">
+      <Transition name="tab" mode="out-in">
+      <div v-show="activeTab === 'quote'" key="quote">
         <!-- Search Card -->
         <div class="card" style="margin-bottom: 16px;">
           <div class="card-body" style="padding: 12px 16px;">
@@ -263,9 +267,11 @@
           </div>
         </div>
       </div>
+      </Transition>
 
       <!-- ==================== Tab 2: 涨停分析 ==================== -->
-      <div v-show="activeTab === 'limitup'">
+      <Transition name="tab" mode="out-in">
+      <div v-show="activeTab === 'limitup'" key="limitup">
         <div v-if="market === 'US'" class="card" style="margin-bottom: 16px;">
           <div class="empty-state">
             <div class="empty-state-icon">🔥</div>
@@ -279,107 +285,8 @@
           </div>
         </div>
       </div>
+      </Transition>
 
-      <!-- ==================== Tab 3: 策略选股 ==================== -->
-      <div v-show="activeTab === 'strategy'">
-        <div v-if="market === 'US'" class="card" style="margin-bottom: 16px;">
-          <div class="empty-state">
-            <div class="empty-state-icon">📊</div>
-            <div class="empty-state-text">请切换到A股查看策略选股</div>
-            <div class="empty-state-hint">策略选股仅支持A股市场</div>
-          </div>
-        </div>
-        <div v-else class="card" style="margin-bottom: 16px;">
-          <div class="card-body">
-            <StrategyPanel @select-stock="handleStrategySelect" />
-          </div>
-        </div>
-      </div>
-
-      <!-- ==================== Tab 4: 交易助手 ==================== -->
-      <div v-show="activeTab === 'trading'">
-        <div class="card" style="margin-bottom: 16px;">
-          <div class="card-header">
-            <div class="card-title">📋 仓位管理</div>
-          </div>
-          <div class="card-body">
-            <PositionManager />
-          </div>
-        </div>
-        <div class="card" style="margin-bottom: 16px;">
-          <div class="card-header">
-            <div class="card-title">📜 交易规则</div>
-          </div>
-          <div class="card-body">
-            <TradingRules />
-          </div>
-        </div>
-      </div>
-
-      <!-- ==================== Tab 5: 自选股 ==================== -->
-      <div v-show="activeTab === 'watchlist'">
-        <div class="card" style="margin-bottom: 16px;">
-          <div class="card-header">
-            <div class="card-title">
-              ⭐ 自选股
-              <span class="badge badge-secondary">{{ watchlist.length }}</span>
-            </div>
-            <button v-if="watchlist.length > 0" class="btn btn-ghost btn-sm" @click="refreshWatchlist" :disabled="loading">
-              <span v-if="loading" class="loading-spinner"></span>
-              🔄 刷新
-            </button>
-          </div>
-          <div class="card-body" style="padding: 8px;">
-            <div v-if="watchlist.length === 0" class="empty-state">
-              <div class="empty-state-icon">⭐</div>
-              <div class="empty-state-text">暂无自选股</div>
-              <div class="empty-state-hint">搜索股票后点击"加自选"</div>
-            </div>
-            <div v-for="stock in watchlist" :key="stock.symbol" class="watchlist-item" @click="handleWatchlistClick(stock)">
-              <div class="watchlist-left">
-                <div class="watchlist-symbol">
-                  {{ stock.symbol }}
-                  <span class="badge badge-outline" style="font-size: 10px; padding: 0 4px;">
-                    {{ stock.market === 'US' ? '美股' : 'A股' }}
-                  </span>
-                </div>
-                <div class="watchlist-name">{{ stock.name }}</div>
-              </div>
-              <div class="watchlist-right">
-                <div class="watchlist-price">
-                  <div class="watchlist-price-value">{{ formatPrice(stock.price, stock.currency) }}</div>
-                  <div class="watchlist-price-change" :class="(stock.change || 0) >= 0 ? 'text-green' : 'text-red'">
-                    {{ ((stock.change || 0) >= 0 ? '+' : '') + (stock.change || 0).toFixed(2) }}
-                    ({{ ((stock.changePercent || 0) >= 0 ? '+' : '') + (stock.changePercent || 0).toFixed(2) }}%)
-                  </div>
-                </div>
-                <button class="watchlist-remove" @click.stop="removeFromWatchlist(stock.symbol)">✕</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- ==================== Tab 6: 技术指标 ==================== -->
-      <div v-show="activeTab === 'indicators'">
-        <div class="card" style="margin-bottom: 16px;">
-          <div class="card-header">
-            <div class="card-title">📐 技术指标分析</div>
-          </div>
-          <div class="card-body">
-            <TechnicalIndicators :data="history" />
-          </div>
-        </div>
-      </div>
-
-      <!-- ==================== Tab 7: 回测分析 ==================== -->
-      <div v-show="activeTab === 'backtest'">
-        <div class="card" style="margin-bottom: 16px;">
-          <div class="card-body">
-            <BacktestPanel />
-          </div>
-        </div>
-      </div>
     </main>
 
     <footer class="footer">
@@ -395,12 +302,7 @@ import { fetchUSStock, fetchUSHistory, fetchCNStock, fetchCNHistory, searchUS, s
 import HistoryChart from './components/HistoryChart.vue'
 import SignalAlert from './components/SignalAlert.vue'
 import RiskCheck from './components/RiskCheck.vue'
-import PositionManager from './components/PositionManager.vue'
-import TradingRules from './components/TradingRules.vue'
 import LimitUpPanel from './components/LimitUpPanel.vue'
-import StrategyPanel from './components/StrategyPanel.vue'
-import BacktestPanel from './components/BacktestPanel.vue'
-import TechnicalIndicators from './components/TechnicalIndicators.vue'
 
 const DEFAULT_POPULAR_US = [
   { symbol: 'AAPL', name: '苹果' },
@@ -427,7 +329,7 @@ const MAX_RETRIES = 2
 
 export default {
   name: 'App',
-  components: { HistoryChart, SignalAlert, RiskCheck, PositionManager, TradingRules, LimitUpPanel, StrategyPanel, BacktestPanel, TechnicalIndicators },
+  components: { HistoryChart, SignalAlert, RiskCheck, LimitUpPanel },
   setup() {
     const market = ref('CN')
     const searchQuery = ref('')
@@ -441,6 +343,27 @@ export default {
 
     // Main tab
     const activeTab = ref('limitup')
+
+    // Theme
+    const isDark = ref(false)
+
+    function toggleTheme() {
+      isDark.value = !isDark.value
+      if (isDark.value) {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        localStorage.setItem('stock-theme', 'dark')
+      } else {
+        document.documentElement.removeAttribute('data-theme')
+        localStorage.setItem('stock-theme', 'light')
+      }
+    }
+
+    // Init theme from localStorage
+    const savedTheme = localStorage.getItem('stock-theme')
+    if (savedTheme === 'dark') {
+      isDark.value = true
+      document.documentElement.setAttribute('data-theme', 'dark')
+    }
 
     // Search dropdown
     const searchResults = ref([])
@@ -460,11 +383,6 @@ export default {
     const mainTabs = [
       { key: 'limitup', icon: '🔥', label: '涨停分析' },
       { key: 'quote', icon: '📈', label: '行情查询' },
-      { key: 'strategy', icon: '📊', label: '策略选股' },
-      { key: 'backtest', icon: '📉', label: '策略回测' },
-      { key: 'trading', icon: '📋', label: '交易助手' },
-      { key: 'watchlist', icon: '⭐', label: '自选股' },
-      { key: 'indicators', icon: '📐', label: '技术指标' },
     ]
 
     const currentCustomPicks = computed(() => {
@@ -711,12 +629,6 @@ export default {
       searchStock(stock.symbol, stock.market)
     }
 
-    function handleStrategySelect({ symbol, market: mkt }) {
-      activeTab.value = 'quote'
-      searchQuery.value = symbol
-      searchStock(symbol, mkt)
-    }
-
     function handleLimitUpSelect({ symbol }) {
       activeTab.value = 'quote'
       searchQuery.value = symbol
@@ -795,7 +707,7 @@ export default {
     return {
       market, searchQuery, selectedStock, watchlist, history,
       loading, historyLoading, error, retryAvailable,
-      activeTab, mainTabs,
+      activeTab, mainTabs, isDark,
       searchResults, showDropdown,
       customPicksUS, customPicksCN, currentCustomPicks,
       showAddPick, addPickSymbol, addPickName,
@@ -803,8 +715,8 @@ export default {
       formatPrice, formatNumber,
       onSearchInput, selectSearchResult,
       switchMarket, handleSearch, handleRetry,
-      handleQuickSearch, handleWatchlistClick, handleStrategySelect, handleLimitUpSelect,
-      toggleWatchlist, removeFromWatchlist, refreshWatchlist,
+      handleQuickSearch, handleWatchlistClick, handleLimitUpSelect,
+      toggleTheme, toggleWatchlist, removeFromWatchlist, refreshWatchlist,
       removeCustomPick, confirmAddPick,
     }
   },
