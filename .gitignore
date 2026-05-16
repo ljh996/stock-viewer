@@ -9,3 +9,4 @@ project.zip
 *.b64
 deploy_key
 deploy_key.pub
+local-config.ps1

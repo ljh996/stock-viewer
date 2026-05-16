@@ -6,6 +6,26 @@
 - `client/` — Vue 3 + Vite 前端 (开发端口 5173)
 - `python/api.py` — Python AkShare 微服务 (端口 3081，未运行)
 
+## 本地配置（敏感信息）
+创建 `local-config.ps1`（已加入 .gitignore，不会上传），写入：
+
+```powershell
+$env:DEEPSEEK_API_KEY = "你的DeepSeek Key"
+$env:DEPLOY_HOST = "你的服务器IP"
+$env:DEPLOY_USER = "root"
+$env:DEPLOY_PASSWORD = "你的服务器密码"
+```
+
+启动/部署时自动加载：
+```powershell
+# 方式1：手动加载
+. ./local-config.ps1
+node server/index.js
+
+# 方式2：deploy.py 会自动读取 local-config.ps1
+python deploy.py
+```
+
 ## 本地启动
 ```powershell
 # 后端 (带代理用于访问外网API)

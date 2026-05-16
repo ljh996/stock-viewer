@@ -1,4 +1,13 @@
-import paramiko, os, sys
+import paramiko, os, sys, re
+
+# 自动加载 local-config.ps1（如果存在）
+config_path = os.path.join(os.path.dirname(__file__), 'local-config.ps1')
+if os.path.exists(config_path):
+    with open(config_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            m = re.match(r'\$env:(\w+)\s*=\s*"([^"]*)"', line)
+            if m:
+                os.environ.setdefault(m.group(1), m.group(2))
 
 host = os.environ.get('DEPLOY_HOST')
 password = os.environ.get('DEPLOY_PASSWORD')
@@ -6,6 +15,7 @@ username = os.environ.get('DEPLOY_USER', 'root')
 
 if not host or not password:
     print('Error: 请设置环境变量 DEPLOY_HOST 和 DEPLOY_PASSWORD')
+    print('提示：可创建 local-config.ps1 文件（已加入 .gitignore）')
     sys.exit(1)
 
 client = paramiko.SSHClient()
