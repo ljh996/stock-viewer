@@ -1010,12 +1010,14 @@ async function getLimitUpByDate(dateStr) {
         stocks = list.map(s => ({
           symbol: String(s.c || '').padStart(6, '0'),
           name: s.n || '',
-          price: parseFloat(s.p || 0),
+          price: parseFloat((parseFloat(s.p || 0) / 1000).toFixed(2)),
           change_percent: parseFloat(s.zdp || 0),
           turnover_rate: parseFloat(s.hs || 0),
-          change_amount: parseFloat(s.zde || 0),
+          change_amount: parseFloat((parseFloat(s.zde || 0) / 1000).toFixed(2)),
           amount: parseFloat(s.amount || 0),
-          limit_up_count: 1, score: null, industry: null,
+          limit_up_count: parseInt(s.boa || 1) || 1,
+          score: null,
+          industry: s.yw || null,
         }))
       }
     }
