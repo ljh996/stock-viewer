@@ -120,129 +120,133 @@ async function httpGetWithTimeout(urlStr, options = {}, timeout = 8000) {
   return httpGet(urlStr, { ...options, timeout })
 }
 
-// ==================== 美股 API（多数据源降级） ====================
+// ==================== 美股 API（新浪财经 gb_ 接口） ====================
 
-// 数据源1: stockprices.dev
-async function fetchUSFromStockPrices(symbol) {
-  const { ok, body } = await httpGetWithTimeout(`https://stockprices.dev/api/stocks/${encodeURIComponent(symbol)}`)
-  if (!ok) throw new Error('stockprices.dev 请求失败')
-  const d = JSON.parse(body)
-  if (!d || !d.Ticker) throw new Error('未找到该股票')
-  return {
-    symbol: d.Ticker,
-    name: d.Name || symbol,
-    price: d.Price,
-    change: d.ChangeAmount,
-    changePercent: d.ChangePercentage,
-    open: d.Open || d.Price,
-    high: d.High || d.Price,
-    low: d.Low || d.Price,
-    volume: d.Volume || 0,
-    previousClose: d.Price - d.ChangeAmount,
-    currency: 'USD',
-    market: 'US',
-  }
-}
+// 内置美股热门股票列表（用于搜索）
+const usStockDB = [
+  { symbol: 'AAPL', name: 'Apple (苹果)' }, { symbol: 'MSFT', name: 'Microsoft (微软)' },
+  { symbol: 'GOOGL', name: 'Alphabet (谷歌)' }, { symbol: 'GOOG', name: 'Alphabet C (谷歌)' },
+  { symbol: 'AMZN', name: 'Amazon (亚马逊)' }, { symbol: 'NVDA', name: 'NVIDIA (英伟达)' },
+  { symbol: 'TSLA', name: 'Tesla (特斯拉)' }, { symbol: 'META', name: 'Meta (脸书)' },
+  { symbol: 'BRK.B', name: 'Berkshire Hathaway (伯克希尔)' }, { symbol: 'BRK.A', name: 'Berkshire Hathaway A' },
+  { symbol: 'JPM', name: 'JPMorgan Chase (摩根大通)' }, { symbol: 'V', name: 'Visa' },
+  { symbol: 'JNJ', name: 'Johnson & Johnson (强生)' }, { symbol: 'WMT', name: 'Walmart (沃尔玛)' },
+  { symbol: 'PG', name: 'Procter & Gamble (宝洁)' }, { symbol: 'MA', name: 'Mastercard (万事达)' },
+  { symbol: 'UNH', name: 'UnitedHealth (联合健康)' }, { symbol: 'HD', name: 'Home Depot (家得宝)' },
+  { symbol: 'BAC', name: 'Bank of America (美国银行)' }, { symbol: 'DIS', name: 'Walt Disney (迪士尼)' },
+  { symbol: 'NFLX', name: 'Netflix (奈飞)' }, { symbol: 'ADBE', name: 'Adobe' },
+  { symbol: 'CRM', name: 'Salesforce' }, { symbol: 'PEP', name: 'PepsiCo (百事可乐)' },
+  { symbol: 'KO', name: 'Coca-Cola (可口可乐)' }, { symbol: 'AVGO', name: 'Broadcom (博通)' },
+  { symbol: 'TMO', name: 'Thermo Fisher Scientific' }, { symbol: 'COST', name: 'Costco (好市多)' },
+  { symbol: 'ABBV', name: 'AbbVie (艾伯维)' }, { symbol: 'CVX', name: 'Chevron (雪佛龙)' },
+  { symbol: 'AMD', name: 'AMD (超威半导体)' }, { symbol: 'INTC', name: 'Intel (英特尔)' },
+  { symbol: 'QCOM', name: 'Qualcomm (高通)' }, { symbol: 'IBM', name: 'IBM' },
+  { symbol: 'ORCL', name: 'Oracle (甲骨文)' }, { symbol: 'CSCO', name: 'Cisco (思科)' },
+  { symbol: 'MRK', name: 'Merck (默克)' }, { symbol: 'NKE', name: 'Nike (耐克)' },
+  { symbol: 'BA', name: 'Boeing (波音)' }, { symbol: 'MCD', name: "McDonald's (麦当劳)" },
+  { symbol: 'SBUX', name: 'Starbucks (星巴克)' }, { symbol: 'PYPL', name: 'PayPal' },
+  { symbol: 'UBER', name: 'Uber' }, { symbol: 'SNAP', name: 'Snap' },
+  { symbol: 'TSM', name: 'TSMC (台积电)' }, { symbol: 'BABA', name: 'Alibaba (阿里巴巴)' },
+  { symbol: 'PDD', name: 'Pinduoduo (拼多多)' }, { symbol: 'JD', name: 'JD.com (京东)' },
+  { symbol: 'BIDU', name: 'Baidu (百度)' }, { symbol: 'NIO', name: 'NIO (蔚来)' },
+  { symbol: 'LI', name: 'Li Auto (理想汽车)' }, { symbol: 'XPEV', name: 'XPeng (小鹏汽车)' },
+  { symbol: 'F', name: 'Ford (福特)' }, { symbol: 'GM', name: 'General Motors (通用汽车)' },
+  { symbol: 'CAT', name: 'Caterpillar (卡特彼勒)' }, { symbol: 'GE', name: 'General Electric (通用电气)' },
+  { symbol: 'XOM', name: 'Exxon Mobil (埃克森美孚)' }, { symbol: 'PFE', name: 'Pfizer (辉瑞)' },
+  { symbol: 'GILD', name: 'Gilead Sciences (吉利德)' }, { symbol: 'AMGN', name: 'Amgen (安进)' },
+  { symbol: 'T', name: 'AT&T' }, { symbol: 'VZ', name: 'Verizon (威瑞森)' },
+  { symbol: 'TMUS', name: 'T-Mobile US' }, { symbol: 'AMAT', name: 'Applied Materials (应用材料)' },
+  { symbol: 'MU', name: 'Micron (美光科技)' }, { symbol: 'NOW', name: 'ServiceNow' },
+  { symbol: 'SHOP', name: 'Shopify' }, { symbol: 'SPOT', name: 'Spotify' },
+  { symbol: 'ZM', name: 'Zoom' }, { symbol: 'PLTR', name: 'Palantir' },
+  { symbol: 'RIVN', name: 'Rivian' }, { symbol: 'SPY', name: 'SPDR S&P 500 ETF' },
+  { symbol: 'QQQ', name: 'Invesco QQQ Trust (纳斯达克ETF)' }, { symbol: 'DIA', name: 'SPDR Dow Jones ETF' },
+  { symbol: 'IWM', name: 'iShares Russell 2000 ETF' }, { symbol: 'GLD', name: 'SPDR Gold Trust (黄金ETF)' },
+  { symbol: 'SLV', name: 'iShares Silver Trust (白银ETF)' }, { symbol: 'USO', name: 'United States Oil Fund (原油ETF)' },
+  { symbol: 'TQQQ', name: 'ProShares UltraPro QQQ (3倍做多纳指)' }, { symbol: 'SQQQ', name: 'ProShares UltraPro Short QQQ (3倍做空纳指)' },
+]
 
-// 数据源2: finnhub.io (免费，无需key)
-async function fetchUSFromFinnhub(symbol) {
-  const { ok, body } = await httpGetWithTimeout(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}`)
-  if (!ok) throw new Error('finnhub 请求失败')
-  const d = JSON.parse(body)
-  if (!d || d.c === 0) throw new Error('finnhub 无数据')
-  return {
-    symbol,
-    name: symbol,
-    price: d.c,
-    change: d.d,
-    changePercent: d.dp,
-    open: d.o,
-    high: d.h,
-    low: d.l,
-    volume: 0,
-    previousClose: d.pc,
-    currency: 'USD',
-    market: 'US',
-  }
-}
-
-// 美股行情（自动降级）
+// 美股行情（新浪财经 gb_ 接口）
 app.get('/api/stock/us/:symbol', async (req, res) => {
   try {
     const symbol = String(req.params.symbol).toUpperCase()
+    const sinaSymbol = `gb_${symbol.toLowerCase()}`
 
-    // 尝试数据源1
-    let data
-    try {
-      data = await fetchUSFromStockPrices(symbol)
-    } catch {
-      console.log(`stockprices.dev 失败，降级到 finnhub: ${symbol}`)
-      try {
-        data = await fetchUSFromFinnhub(symbol)
-      } catch {
-        return res.status(404).json({ success: false, error: '未找到该股票，请检查代码是否正确' })
-      }
+    const { ok, body } = await httpGet(
+      `https://hq.sinajs.cn/list=${sinaSymbol}`,
+      { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
+    )
+    if (!ok) throw new Error('请求新浪接口失败')
+
+    const match = body.match(/"([^"]+)"/)
+    if (!match) {
+      return res.json({ success: false, error: '未找到该股票，请检查代码是否正确' })
     }
 
-    res.json({ success: true, data })
+    const parts = match[1].split(',')
+    if (!parts || parts.length < 7) {
+      return res.json({ success: false, error: '股票数据格式异常' })
+    }
+
+    // 新浪 gb_ 格式: name, price, change%, time, $change, low, high, pre_low, pre_high, 52w_low, volume, ...
+    const name = parts[0] || symbol
+    const price = parseFloat(parts[1]) || 0
+    const changeDollar = parts.length > 4 ? (parseFloat(parts[4]) || 0) : 0
+    const prevClose = parts.length > 26 ? (parseFloat(parts[26]) || 0) : price - changeDollar
+    const change = price - prevClose
+    const changePercent = prevClose > 0 ? (change / prevClose) * 100 : (parseFloat(parts[2]) || 0)
+    const dayLow = parseFloat(parts[5]) || Math.min(price, prevClose)
+    const dayHigh = parseFloat(parts[6]) || Math.max(price, prevClose)
+    const volume = parseInt(parts[10]) || 0
+
+    // 用实时价校正 range
+    const low = Math.min(dayLow, price)
+    const high = Math.max(dayHigh, price)
+
+    res.json({
+      success: true,
+      data: {
+        symbol, name, price,
+        change: parseFloat(change.toFixed(2)),
+        changePercent: parseFloat(changePercent.toFixed(2)),
+        open: parseFloat(prevClose.toFixed(2)),
+        high, low, volume,
+        previousClose: parseFloat(prevClose.toFixed(2)),
+        currency: 'USD',
+        market: 'US',
+      },
+    })
   } catch (err) {
     console.error('美股行情请求失败:', err.message)
     res.status(500).json({ success: false, error: `获取美股数据失败: ${err.message}` })
   }
 })
 
-// 美股历史数据（Twelve Data，带降级）
+// 美股历史数据（新浪 US K-line 接口）
 app.get('/api/stock/us/:symbol/history', async (req, res) => {
   try {
     const symbol = String(req.params.symbol).toUpperCase()
 
-    // 尝试 Twelve Data
-    let history = []
-    try {
-      const { ok, body } = await httpGetWithTimeout(
-        `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&outputsize=30&apikey=demo`
-      )
-      if (ok) {
-        const parsed = JSON.parse(body)
-        const values = parsed.values || []
-        history = values.map((v) => ({
-          date: v.datetime,
-          open: parseFloat(v.open),
-          high: parseFloat(v.high),
-          low: parseFloat(v.low),
-          close: parseFloat(v.close),
-          volume: parseInt(v.volume) || 0,
-        })).filter((d) => d.close > 0)
-      }
-    } catch {
-      console.log('Twelve Data 历史失败，尝试备用源')
+    const { ok, body } = await httpGet(
+      `https://stock.finance.sina.com.cn/usstock/api/json_v2.php/US_MinKService.getDailyK?symbol=${symbol}`,
+      { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
+    )
+    if (!ok) {
+      return res.status(500).json({ success: false, error: '获取美股历史数据失败' })
     }
 
-    // 降级：用 finnhub 获取 candle 数据
-    if (history.length === 0) {
-      try {
-        const to = Math.floor(Date.now() / 1000)
-        const from = to - 30 * 24 * 3600
-        const { ok, body } = await httpGetWithTimeout(
-          `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=D&from=${from}&to=${to}`
-        )
-        if (ok) {
-          const d = JSON.parse(body)
-          if (d.s === 'ok' && d.t) {
-            history = d.t.map((t, i) => ({
-              date: new Date(t * 1000).toISOString().split('T')[0],
-              open: d.o[i],
-              high: d.h[i],
-              low: d.l[i],
-              close: d.c[i],
-              volume: d.v[i] || 0,
-            })).filter((h) => h.close > 0)
-          }
-        }
-      } catch {
-        // ignore
-      }
-    }
+    let data
+    try { data = JSON.parse(body) } catch { return res.json({ success: true, data: [] }) }
+    if (!Array.isArray(data)) return res.json({ success: true, data: [] })
+
+    const history = data.slice(-30).map((item) => ({
+      date: item.d || item.day,
+      open: parseFloat(item.o || item.open),
+      high: parseFloat(item.h || item.high),
+      low: parseFloat(item.l || item.low),
+      close: parseFloat(item.c || item.close),
+      volume: parseInt(item.v || item.volume) || 0,
+    })).filter((d) => d.close > 0)
 
     res.json({ success: true, data: history })
   } catch (err) {
@@ -251,39 +255,54 @@ app.get('/api/stock/us/:symbol/history', async (req, res) => {
   }
 })
 
-// 美股搜索（按名称/代码模糊搜索）
+// 美股搜索（内置热门股票列表 + 新浪 suggest 补充）
 app.get('/api/search/us/:keyword', async (req, res) => {
   try {
-    const keyword = req.params.keyword.toUpperCase()
-    // 用 stockprices.dev 尝试精确匹配
-    try {
-      const { ok, body } = await httpGetWithTimeout(`https://stockprices.dev/api/stocks/${encodeURIComponent(keyword)}`)
-      if (ok) {
-        const d = JSON.parse(body)
-        if (d && d.Ticker) {
-          return res.json({ success: true, data: [{ symbol: d.Ticker, name: d.Name || d.Ticker }] })
+    const keyword = req.params.keyword.trim()
+    const kwUpper = keyword.toUpperCase()
+
+    // 1. 先从内置列表匹配
+    let results = usStockDB.filter(s =>
+      s.symbol.includes(kwUpper) || s.name.toUpperCase().includes(kwUpper)
+    )
+
+    // 2. 如果没找到，尝试新浪 suggest（type=12 为美股）
+    if (results.length === 0) {
+      try {
+        const { ok, body } = await httpGet(
+          `https://suggest3.sinajs.cn/suggest/type=12&key=${encodeURIComponent(keyword)}`,
+          { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
+        )
+        if (ok && body) {
+          const m = body.match(/"([^"]+)"/)
+          if (m) {
+            const items = m[1].split(';')
+            for (const item of items) {
+              const fields = item.split(',')
+              if (fields.length >= 4) {
+                const name = fields[0]
+                const code = fields[2]
+                if (code && name) {
+                  results.push({ symbol: code, name })
+                }
+              }
+            }
+          }
         }
+      } catch (e) {
+        console.log('新浪 suggest 美股搜索失败:', e.message)
       }
-    } catch { /* ignore */ }
+    }
 
-    // 降级：用 finnhub 搜索
-    try {
-      const { ok, body } = await httpGetWithTimeout(`https://finnhub.io/api/v1/search?q=${encodeURIComponent(keyword)}&token=demo`)
-      if (ok) {
-        const d = JSON.parse(body)
-        const results = (d.result || []).slice(0, 10).map(r => ({
-          symbol: r.symbol,
-          name: r.description,
-        }))
-        return res.json({ success: true, data: results })
-      }
-    } catch { /* ignore */ }
-
-    res.json({ success: true, data: [] })
+    // 3. 提示用户可输入的常见股票
+    return res.json({ success: true, data: results.slice(0, 10) })
   } catch (err) {
+    console.error('美股搜索失败:', err.message)
     res.status(500).json({ success: false, error: `搜索失败: ${err.message}` })
   }
 })
+
+// ==================== A股 API（新浪财经） ====================
 
 // ==================== A股 API（新浪财经） ====================
 

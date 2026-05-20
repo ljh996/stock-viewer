@@ -294,7 +294,7 @@
     </main>
 
     <footer class="footer">
-      <p>股票行情查看器 · Vue3 + Express · 数据来源：stockprices.dev / 新浪财经</p>
+      <p>股票行情查看器 · Vue3 + Express · 数据来源：新浪财经 / 东方财富</p>
       <p style="margin-top: 4px;">数据仅供参考，不构成任何投资建议</p>
     </footer>
   </div>

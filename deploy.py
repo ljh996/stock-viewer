@@ -22,17 +22,26 @@ client = paramiko.SSHClient()
 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 client.connect(host, username=username, password=password, timeout=10)
 
-dist_dir = r'D:\agentAIdemo\stock-viewer\stock-viewer\client\dist'
-remote_dist = '/var/www/stock-viewer/client/dist'
+base_dir = os.path.dirname(os.path.abspath(__file__))
+remote_base = '/opt/stock-viewer'
+
+# 1. 上传 server/index.js
+local_server = os.path.join(base_dir, 'server', 'index.js')
+remote_server = remote_base + '/server/index.js'
+print('Uploading server/index.js...')
+sftp = client.open_sftp()
+sftp.put(local_server, remote_server)
+print('  OK')
+
+# 2. 上传前端 dist
+dist_dir = os.path.join(base_dir, 'client', 'dist')
+remote_dist = remote_base + '/client/dist'
 
 # Clean remote dist
-stdin, stdout, stderr = client.exec_command('rm -rf /var/www/stock-viewer/client/dist/*')
+stdin, stdout, stderr = client.exec_command('rm -rf ' + remote_dist + '/*')
 stdout.channel.recv_exit_status()
-
-stdin, stdout, stderr = client.exec_command('mkdir -p /var/www/stock-viewer/client/dist/assets')
+stdin, stdout, stderr = client.exec_command('mkdir -p ' + remote_dist + '/assets')
 stdout.channel.recv_exit_status()
-
-sftp = client.open_sftp()
 
 for root, dirs, files in os.walk(dist_dir):
     for fname in files:
@@ -45,11 +54,22 @@ for root, dirs, files in os.walk(dist_dir):
 sftp.close()
 
 print('\n=== DEPLOYED ===')
-stdin, stdout, stderr = client.exec_command('find /var/www/stock-viewer/client/dist/ -type f | sort')
+stdin, stdout, stderr = client.exec_command('find ' + remote_base + '/client/dist/ -type f | sort')
 print(stdout.read().decode('utf-8', errors='replace'))
 
-stdin, stdout, stderr = client.exec_command('pm2 restart stock-viewer')
-print(stdout.read().decode('utf-8', errors='replace'))
+# Restart: kill old process and start new one
+stdin, stdout, stderr = client.exec_command(
+    "ps aux | grep 'node.*index.js' | grep -v grep | awk '{print $2}' | head -1"
+)
+old_pid = stdout.read().decode('utf-8', errors='replace').strip()
+if old_pid:
+    print(f'Killing old process (PID: {old_pid})...')
+    client.exec_command('kill ' + old_pid)
+
+stdin, stdout, stderr = client.exec_command(
+    'cd /opt/stock-viewer && nohup node server/index.js > server.log 2>&1 &'
+)
+print('New server process started')
 
 client.close()
 print('Deploy complete!')
