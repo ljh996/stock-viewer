@@ -204,16 +204,20 @@
             </div>
           </div>
 
-          <!-- Signal Alert + Risk Check -->
-          <div v-if="!loading" class="analysis-grid" style="margin-bottom: 16px;">
+          <!-- AI Health Check -->
+          <div v-if="!loading" style="margin-bottom: 16px;">
+            <div class="card">
+              <div class="card-body">
+                <AIHealthCheck :stock="selectedStock" />
+              </div>
+            </div>
+          </div>
+
+          <!-- AI 买卖信号分析 -->
+          <div v-if="!loading" style="margin-bottom: 16px;">
             <div class="card">
               <div class="card-body">
                 <SignalAlert :stock="selectedStock" />
-              </div>
-            </div>
-            <div class="card">
-              <div class="card-body">
-                <RiskCheck />
               </div>
             </div>
           </div>
@@ -300,8 +304,8 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { fetchUSStock, fetchUSHistory, fetchCNStock, fetchCNHistory, searchUS, searchCN } from './api/stock.js'
 import HistoryChart from './components/HistoryChart.vue'
+import AIHealthCheck from './components/AIHealthCheck.vue'
 import SignalAlert from './components/SignalAlert.vue'
-import RiskCheck from './components/RiskCheck.vue'
 import LimitUpPanel from './components/LimitUpPanel.vue'
 
 const DEFAULT_POPULAR_US = [
@@ -329,7 +333,7 @@ const MAX_RETRIES = 2
 
 export default {
   name: 'App',
-  components: { HistoryChart, SignalAlert, RiskCheck, LimitUpPanel },
+  components: { HistoryChart, AIHealthCheck, SignalAlert, LimitUpPanel },
   setup() {
     const market = ref('CN')
     const searchQuery = ref('')
@@ -607,8 +611,31 @@ export default {
       }
     }
 
-    function handleSearch() {
-      searchStock(searchQuery.value, market.value)
+    async function handleSearch() {
+      let query = searchQuery.value.trim()
+      if (!query) return
+
+      // 非纯数字（含中文名称），自动搜索并取第一条结果
+      if (!/^\d+$/.test(query) && searchResults.value.length > 0) {
+        const match = searchResults.value.find(r => r.name === query) || searchResults.value[0]
+        query = match.symbol
+        searchQuery.value = match.symbol
+        searchResults.value = []
+        showDropdown.value = false
+      } else if (!/^\d+$/.test(query) && searchResults.value.length === 0) {
+        // 搜索结果还没回来，先搜索再取第一个
+        try {
+          const searchFn = market.value === 'US' ? searchUS : searchCN
+          const res = await searchFn(query)
+          if (res.data?.success && Array.isArray(res.data.data) && res.data.data.length > 0) {
+            const match = res.data.data[0]
+            query = match.symbol
+            searchQuery.value = match.symbol
+          }
+        } catch {}
+      }
+
+      searchStock(query, market.value)
     }
 
     function handleRetry() {

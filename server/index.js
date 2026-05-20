@@ -308,17 +308,51 @@ const cnStockDB = [
 
 app.get('/api/search/cn/:keyword', async (req, res) => {
   try {
-    const kw = req.params.keyword.trim().toLowerCase()
-    // 先按代码精确匹配
-    let results = cnStockDB.filter(s => s.symbol === kw)
-    // 再按名称模糊匹配
+    const kw = req.params.keyword.trim()
+    const kwLower = kw.toLowerCase()
+
+    // 1. 先按代码精确匹配
+    let results = cnStockDB.filter(s => s.symbol === kwLower)
+    // 2. 再按名称模糊匹配
     if (results.length === 0) {
-      results = cnStockDB.filter(s => s.name.includes(kw) || s.symbol.includes(kw))
+      results = cnStockDB.filter(s => s.name.includes(kw) || s.symbol.includes(kwLower))
     }
-    // 如果是纯数字，也直接返回（可能是代码）
+
+    // 3. 本地没有则请求新浪 suggest API 实时搜索
+    if (results.length === 0) {
+      try {
+        const { ok, body } = await httpGet(
+          `https://suggest3.sinajs.cn/suggest/type=11&key=${encodeURIComponent(kw)}`,
+          { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
+        )
+        if (ok && body) {
+          // 解析新浪 suggest 返回数据
+          // 格式: var suggestvalue="苏州银行,11,002966,sz002966,...;..."
+          const m = body.match(/"([^"]+)"/)
+          if (m) {
+            const items = m[1].split(';')
+            for (const item of items) {
+              const fields = item.split(',')
+              if (fields.length >= 4) {
+                const name = fields[0]
+                const code = fields[2]
+                if (code && /^\d{6}$/.test(code) && name) {
+                  results.push({ symbol: code, name })
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.log('新浪 suggest 搜索失败:', e.message)
+      }
+    }
+
+    // 4. 如果是纯数字但没搜到，当未知代码处理
     if (results.length === 0 && /^\d{6}$/.test(kw)) {
       results = [{ symbol: kw, name: '未知股票' }]
     }
+
     res.json({ success: true, data: results.slice(0, 10) })
   } catch (err) {
     res.status(500).json({ success: false, error: `搜索失败: ${err.message}` })
@@ -342,19 +376,23 @@ app.get('/api/stock/cn/:symbol', async (req, res) => {
 
     const match = body.match(/"([^"]+)"/)
     if (!match) {
-      return res.status(500).json({ success: false, error: '无法解析A股数据，请检查股票代码' })
+      return res.json({ success: false, error: '未找到该股票数据，请检查股票代码是否正确' })
     }
 
     const parts = match[1].split(',')
-    const name = parts[0]
-    const open = parseFloat(parts[1])
-    const prevClose = parseFloat(parts[2])
-    const price = parseFloat(parts[3])
-    const high = parseFloat(parts[4])
-    const low = parseFloat(parts[5])
-    const volume = parseFloat(parts[8])
+    if (!parts || parts.length < 3) {
+      return res.json({ success: false, error: '股票数据格式异常，该代码可能无效' })
+    }
+
+    const name = parts[0] || '未知'
+    const open = parseFloat(parts[1]) || 0
+    const prevClose = parseFloat(parts[2]) || 0
+    const price = parseFloat(parts[3]) || prevClose || open
+    const high = parseFloat(parts[4]) || price
+    const low = parseFloat(parts[5]) || price
+    const volume = parseFloat(parts[8]) || 0
     const change = price - prevClose
-    const changePercent = (change / prevClose) * 100
+    const changePercent = prevClose > 0 ? (change / prevClose) * 100 : 0
 
     res.json({
       success: true,
@@ -371,6 +409,101 @@ app.get('/api/stock/cn/:symbol', async (req, res) => {
   } catch (err) {
     console.error('A股行情请求失败:', err.message)
     res.status(500).json({ success: false, error: `获取A股数据失败: ${err.message}` })
+  }
+})
+
+// A股信号参数自动填充（换手率、跌幅等）
+app.get('/api/stock/cn/:symbol/auto-fill', async (req, res) => {
+  try {
+    const { symbol } = req.params
+    const prefix = symbol.startsWith('6') ? 'sh' : 'sz'
+    const sinaSymbol = `${prefix}${symbol}`
+
+    // 1. 获取换手率（腾讯接口）
+    let turnoverRate = null
+    try {
+      const { ok, body } = await httpGetWithTimeout(
+        `https://qt.gtimg.cn/q=${sinaSymbol}`,
+        { headers: { 'Referer': 'https://qt.gtimg.cn' }, encoding: 'gbk' }, 8000
+      )
+      if (ok && body) {
+        // Tencent格式: v_sz002966="...~...~...", 换手率在字段38
+        const m = body.match(/"([^"]+)"/)
+        if (m) {
+          const fields = m[1].split('~')
+          if (fields.length > 39 && fields[38] && parseFloat(fields[38]) > 0) {
+            turnoverRate = parseFloat(fields[38])
+          }
+        }
+      }
+    } catch (e) {
+      console.log('腾讯换手率获取失败:', e.message)
+    }
+
+    // 2. 获取120日历史数据，计算从最高点跌幅
+    let dropFromHigh = null
+    try {
+      const { ok, body } = await httpGetWithTimeout(
+        `https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=${sinaSymbol}&scale=240&ma=no&datalen=120`,
+        { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 10000
+      )
+      if (ok) {
+        let data
+        try { data = JSON.parse(body) } catch { data = [] }
+        if (Array.isArray(data) && data.length > 0) {
+          const currentPrice = parseFloat(data[data.length - 1].close) || 0
+          let maxPrice = 0
+          for (const d of data) {
+            const h = parseFloat(d.high) || 0
+            if (h > maxPrice) maxPrice = h
+          }
+          if (maxPrice > 0 && currentPrice > 0) {
+            dropFromHigh = parseFloat(((maxPrice - currentPrice) / maxPrice * 100).toFixed(1))
+          }
+        }
+      }
+    } catch (e) {
+      console.log('历史数据获取失败:', e.message)
+    }
+
+    // 3. 获取上证指数120日数据，计算大盘跌幅
+    let marketDrop = null
+    try {
+      const { ok, body } = await httpGetWithTimeout(
+        'https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=sh000001&scale=240&ma=no&datalen=120',
+        { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 10000
+      )
+      if (ok) {
+        let data
+        try { data = JSON.parse(body) } catch { data = [] }
+        if (Array.isArray(data) && data.length > 0) {
+          const currentIndex = parseFloat(data[data.length - 1].close) || 0
+          let maxIndex = 0
+          for (const d of data) {
+            const h = parseFloat(d.high) || 0
+            if (h > maxIndex) maxIndex = h
+          }
+          if (maxIndex > 0 && currentIndex > 0) {
+            marketDrop = parseFloat(((maxIndex - currentIndex) / maxIndex * 100).toFixed(1))
+          }
+        }
+      }
+    } catch (e) {
+      console.log('指数数据获取失败:', e.message)
+    }
+
+    res.json({
+      success: true,
+      data: {
+        turnoverRate,
+        dropFromHigh,
+        marketDrop,
+        isNewStock: false,
+      },
+    })
+  } catch (err) {
+    console.error('自动填充失败:', err.message)
+    res.status(500).json({ success: false, error: `自动填充失败: ${err.message}` })
   }
 })
 
@@ -543,6 +676,178 @@ app.get('/api/limit-up/stats', async (req, res) => {
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 
+// AI 个股健康检查
+app.post('/api/ai/health-check', async (req, res) => {
+  try {
+    const stock = req.body
+    if (!stock || !stock.symbol) {
+      return res.status(400).json({ success: false, error: '缺少股票数据' })
+    }
+
+    const changePercent = (stock.changePercent || 0).toFixed(2)
+    const dayRange = ((stock.high || 0) - (stock.low || 0)).toFixed(2)
+    const rangePct = stock.previousClose > 0
+      ? (((stock.high || 0) - (stock.low || 0)) / stock.previousClose * 100).toFixed(2)
+      : 'N/A'
+    const volumeStr = (stock.volume || 0) > 10000
+      ? (stock.volume / 10000).toFixed(0) + '万'
+      : (stock.volume || 0) + '手'
+
+    const prompt = `你是一位顶级AI投顾分析师。请对以下A股/美股进行6维度风险扫描分析。
+
+【股票数据】
+- 代码: ${stock.symbol}
+- 名称: ${stock.name || stock.symbol}
+- 当前价: ${stock.price}
+- 涨跌幅: ${changePercent}%
+- 开盘价: ${stock.open || 'N/A'}
+- 最高价: ${stock.high || 'N/A'}
+- 最低价: ${stock.low || 'N/A'}
+- 昨收: ${stock.previousClose || 'N/A'}
+- 成交量: ${volumeStr}
+- 日内振幅: ${rangePct}%
+- 市场: ${stock.market || 'A股'}
+
+请从以下6个维度进行分析，每个维度给出：score(0-100数值越大风险越高)、level(high/warn/low)、brief(一句话概述)、analysis(详细AI分析)、suggestion(操作建议)、reason(数据依据)。
+
+6个维度:
+1. sentiment(市场情绪): 判断当前市场情绪状态
+2. trend(趋势结构): 分析价格趋势健康度
+3. liquidity(流动性): 评估成交量与流动性
+4. volatility(波动性): 分析价格波动风险
+5. capital(资金博弈): 判断资金流向与博弈情况
+6. valuation(估值安全): 评估估值合理性
+
+然后给出:
+- aiScore: 综合评分(0-100, 越高越危险)
+- conclusionTitle: 结论标题
+- conclusionDesc: 结论描述
+- conclusionTags: 标签数组(3个)
+- advice: 投资建议正文
+- confidence: AI可信度数值(0-100)
+
+请严格按照以下JSON格式返回(不要加markdown标记):
+{
+  "dimensions": [
+    {"key":"sentiment","score":数字,"level":"high/warn/low","brief":"...","analysis":"...","suggestion":"...","reason":"..."},
+    ...
+  ],
+  "aiScore": 数字,
+  "conclusionTitle": "...",
+  "conclusionDesc": "...",
+  "conclusionTags": ["...","...","..."],
+  "advice": "...",
+  "confidence": 数字
+}`
+
+    const response = await httpsPost(
+      'https://api.deepseek.com/v1/chat/completions',
+      {
+        model: 'deepseek-chat',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.7,
+        max_tokens: 3000,
+      },
+      { 'Authorization': `Bearer ${DEEPSEEK_API_KEY}` }
+    )
+
+    if (!response || !response.choices || response.choices.length === 0) {
+      return res.json({ success: false, error: 'AI 分析返回异常' })
+    }
+
+    const content = response.choices[0].message.content
+    try {
+      const parsed = JSON.parse(content)
+      return res.json({ success: true, data: parsed })
+    } catch {
+      return res.json({ success: false, error: 'AI 返回格式异常，请重试' })
+    }
+  } catch (err) {
+    console.error('AI健康检查失败:', err.message)
+    res.status(500).json({ success: false, error: `AI分析失败: ${err.message}` })
+  }
+})
+
+// AI 买卖信号分析
+app.post('/api/ai/signal-analysis', async (req, res) => {
+  try {
+    const { stock, turnoverRate, dropFromHigh, marketDrop, isNewStock } = req.body
+    if (!stock || !stock.symbol) {
+      return res.status(400).json({ success: false, error: '缺少股票数据' })
+    }
+
+    const prompt = `你是一位顶级AI投顾，擅长技术面买卖信号分析。请根据以下数据给出专业的买卖信号研判。
+
+【股票信息】
+- 代码: ${stock.symbol} ${stock.name || ''}
+- 当前价: ${stock.price}
+- 涨跌幅: ${(stock.changePercent || 0).toFixed(2)}%
+
+【用户输入的辅助参数】
+${turnoverRate != null ? `- 今日换手率: ${turnoverRate}%` : '- 换手率: 未提供'}
+${dropFromHigh != null ? `- 个股从最高点跌幅: ${dropFromHigh}%` : '- 个股跌幅: 未提供'}
+${marketDrop != null ? `- 大盘从高点跌幅: ${marketDrop}%` : '- 大盘跌幅: 未提供'}
+- 是否次新股: ${isNewStock ? '是' : '否'}
+
+请从以下角度进行AI研判，返回JSON格式：
+
+1. buySignals: 买入信号列表，每个信号包含:
+   - name: 信号名称
+   - met: 是否满足(true/false)
+   - detail: 具体说明
+   - reason: 数据依据
+
+2. sellSignals: 卖出/风险信号列表，同上格式
+
+3. advice: 综合建议对象:
+   - action: 操作建议文字
+   - reason: 核心理由
+   - confidence: 可信度(0-100)
+
+4. riskLevel: 风险评估 (low/medium/high)
+
+【分析原则】
+- 基于客观数据，不要臆测
+- 专业、简洁、有实操价值
+- 换手率≥30%是明确的风险信号
+- 大盘跌幅≥20% + 个股跌幅≥50% 是重要的底部买入信号
+
+请严格按以下JSON格式返回(不要加markdown标记):
+{
+  "buySignals": [{"name":"...","met":true/false,"detail":"...","reason":"..."}],
+  "sellSignals": [{"name":"...","met":true/false,"detail":"...","reason":"..."}],
+  "advice": {"action":"...","reason":"...","confidence":数字},
+  "riskLevel": "low/medium/high"
+}`
+
+    const response = await httpsPost(
+      'https://api.deepseek.com/v1/chat/completions',
+      {
+        model: 'deepseek-chat',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.7,
+        max_tokens: 2000,
+      },
+      { 'Authorization': `Bearer ${DEEPSEEK_API_KEY}` }
+    )
+
+    if (!response || !response.choices || response.choices.length === 0) {
+      return res.json({ success: false, error: 'AI 分析返回异常' })
+    }
+
+    const content = response.choices[0].message.content
+    try {
+      const parsed = JSON.parse(content)
+      return res.json({ success: true, data: parsed })
+    } catch {
+      return res.json({ success: false, error: 'AI 返回格式异常，请重试' })
+    }
+  } catch (err) {
+    console.error('AI信号分析失败:', err.message)
+    res.status(500).json({ success: false, error: `AI分析失败: ${err.message}` })
+  }
+})
+
 app.get('/api/limit-up/analysis', async (req, res) => {
   try {
     // 获取当天涨停数据
@@ -691,16 +996,17 @@ async function getTodayLimitUp() {
 
 async function getLimitUpByDate(dateStr) {
   let stocks = []
-  // 东方财富涨停股接口
+  // 东方财富涨停股接口（参数同步自 AKShare stock_zt_pool_em）
   try {
-    const url = `https://push2ex.eastmoney.com/getTopicZTPool?ut=7eea3edcaed734bea9teledata&dpt=wz.ztzt&Ession=&date=${dateStr.replace(/-/g, '')}&_=${Date.now()}`
+    const url = `https://push2ex.eastmoney.com/getTopicZTPool?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt&Pageindex=0&pagesize=10000&sort=fbt:asc&date=${dateStr.replace(/-/g, '')}`
     const { ok, body } = await httpGetWithTimeout(url, {
-      headers: { 'Referer': 'https://data.eastmoney.com' }
-    }, 10000)
+      headers: { 'Referer': 'https://quote.eastmoney.com' }
+    }, 15000)
     if (ok) {
       const parsed = JSON.parse(body)
-      const list = (parsed.data && parsed.data.pool) || []
-      if (Array.isArray(list) && list.length > 0) {
+      const pool = parsed.data && parsed.data.pool
+      const list = Array.isArray(pool) ? pool : []
+      if (list.length > 0) {
         stocks = list.map(s => ({
           symbol: String(s.c || '').padStart(6, '0'),
           name: s.n || '',
