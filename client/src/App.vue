@@ -7,9 +7,17 @@
         <span>股票行情查看器</span>
       </div>
       <span class="header-badge">Vue3 + Express</span>
-      <button class="theme-toggle" @click="toggleTheme" :title="isDark ? '切换简约白' : '切换科技风'">
-        {{ isDark ? '☀️' : '🌙' }}
-      </button>
+      <div class="header-right">
+        <button v-if="!loggedInUser" class="login-btn-header" @click="showLogin = true">
+          👤 登录
+        </button>
+        <button v-else class="login-btn-header logged-in" @click="handleLogout">
+          👤 {{ loggedInUser.username }}
+        </button>
+        <button class="theme-toggle" @click="toggleTheme" :title="isDark ? '切换简约白' : '切换科技风'">
+          {{ isDark ? '☀️' : '🌙' }}
+        </button>
+      </div>
     </header>
 
     <!-- Top Tab Bar -->
@@ -293,6 +301,9 @@
 
     </main>
 
+    <!-- 登录弹窗 -->
+    <LoginDialog :visible="showLogin" @close="showLogin = false" @login-success="onLoginSuccess" />
+
     <footer class="footer">
       <p>股票行情查看器 · Vue3 + Express · 数据来源：新浪财经 / 东方财富</p>
       <p style="margin-top: 4px;">数据仅供参考，不构成任何投资建议</p>
@@ -301,12 +312,19 @@
 </template>
 
 <script>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import { fetchUSStock, fetchUSHistory, fetchCNStock, fetchCNHistory, searchUS, searchCN } from './api/stock.js'
+import { ref, computed, onMounted, onUnmounted, watch, provide } from 'vue'
+import { fetchUSStock, fetchUSHistory, fetchCNStock, fetchCNHistory, searchUS, searchCN, setOnUnauthorized } from './api/stock.js'
+import {
+  getDeviceId, fetchWatchlist, addWatchlist as apiAddWatchlist, removeWatchlist as apiRemoveWatchlist,
+  fetchPicks, addPick as apiAddPick, removePick as apiRemovePick,
+  fetchPreferences, savePreferences as apiSavePreferences,
+  savePortfolio as apiSavePortfolio, addPortfolioAction as apiAddPortfolioAction,
+} from './api/user.js'
 import HistoryChart from './components/HistoryChart.vue'
 import AIHealthCheck from './components/AIHealthCheck.vue'
 import SignalAlert from './components/SignalAlert.vue'
 import LimitUpPanel from './components/LimitUpPanel.vue'
+import LoginDialog from './components/LoginDialog.vue'
 
 const DEFAULT_POPULAR_US = [
   { symbol: 'AAPL', name: '苹果' },
@@ -333,7 +351,7 @@ const MAX_RETRIES = 2
 
 export default {
   name: 'App',
-  components: { HistoryChart, AIHealthCheck, SignalAlert, LimitUpPanel },
+  components: { HistoryChart, AIHealthCheck, SignalAlert, LimitUpPanel, LoginDialog },
   setup() {
     const market = ref('CN')
     const searchQuery = ref('')
@@ -350,6 +368,30 @@ export default {
 
     // Theme
     const isDark = ref(false)
+    provide('theme', isDark)
+
+    // Login state
+    const showLogin = ref(false)
+    const loggedInUser = ref(null)
+
+    // 监听 401 时弹出登录
+    setOnUnauthorized(() => {
+      loggedInUser.value = null
+      localStorage.removeItem('jwt-token')
+    })
+
+    // 恢复 JWT 登录状态
+    const savedJwt = localStorage.getItem('jwt-token')
+    if (savedJwt) {
+      // 尝试解析 JWT 获取用户名（不验证签名，仅显示用）
+      try {
+        const payload = JSON.parse(atob(savedJwt.split('.')[1]))
+        loggedInUser.value = { username: payload.username }
+      } catch { /* ignore */ }
+    }
+
+    // API 可用性（MySQL 连接成功时 true）
+    const apiAvailable = ref(true)
 
     function toggleTheme() {
       isDark.value = !isDark.value
@@ -360,6 +402,8 @@ export default {
         document.documentElement.removeAttribute('data-theme')
         localStorage.setItem('stock-theme', 'light')
       }
+      // 同步到 MySQL
+      apiSavePreferences({ theme: isDark.value ? 'dark' : 'light' }).catch(() => {})
     }
 
     // Init theme from localStorage
@@ -398,30 +442,73 @@ export default {
     })
 
     // --- Lifecycle ---
-    onMounted(() => {
-      // Load watchlist (default hot A-stocks if empty)
-      try {
-        const saved = localStorage.getItem(WATCHLIST_KEY)
-        if (saved) {
-          watchlist.value = JSON.parse(saved)
-        } else {
-          // 默认热门A股
-          watchlist.value = [
-            { symbol: '600519', name: '贵州茅台', market: 'CN' },
-            { symbol: '000858', name: '五粮液', market: 'CN' },
-            { symbol: '601318', name: '中国平安', market: 'CN' },
-            { symbol: '300750', name: '宁德时代', market: 'CN' },
-            { symbol: '002594', name: '比亚迪', market: 'CN' },
-            { symbol: '600036', name: '招商银行', market: 'CN' },
-            { symbol: '000333', name: '美的集团', market: 'CN' },
-            { symbol: '600809', name: '山西汾酒', market: 'CN' },
-          ]
-          localStorage.setItem(WATCHLIST_KEY, JSON.stringify(watchlist.value))
-        }
-      } catch { /* ignore */ }
+    onMounted(async () => {
+      // 尝试从 MySQL 加载数据（带 localStorage 降级）
+      const deviceId = getDeviceId()
 
-      // Load custom picks
-      loadCustomPicks()
+      // 1. 加载自选股
+      try {
+        const res = await fetchWatchlist()
+        if (res.data.success && res.data.data.length > 0) {
+          watchlist.value = res.data.data
+          // 同步到 localStorage
+          localStorage.setItem(WATCHLIST_KEY, JSON.stringify(watchlist.value))
+        } else {
+          throw new Error('no data')
+        }
+      } catch {
+        // fallback: 从 localStorage 加载
+        apiAvailable.value = false
+        try {
+          const saved = localStorage.getItem(WATCHLIST_KEY)
+          if (saved) {
+            watchlist.value = JSON.parse(saved)
+          } else {
+            watchlist.value = [
+              { symbol: '600519', name: '贵州茅台', market: 'CN' },
+              { symbol: '000858', name: '五粮液', market: 'CN' },
+              { symbol: '601318', name: '中国平安', market: 'CN' },
+              { symbol: '300750', name: '宁德时代', market: 'CN' },
+              { symbol: '002594', name: '比亚迪', market: 'CN' },
+              { symbol: '600036', name: '招商银行', market: 'CN' },
+              { symbol: '000333', name: '美的集团', market: 'CN' },
+              { symbol: '600809', name: '山西汾酒', market: 'CN' },
+            ]
+            localStorage.setItem(WATCHLIST_KEY, JSON.stringify(watchlist.value))
+          }
+        } catch { /* ignore */ }
+      }
+
+      // 2. 加载自定义热门股
+      try {
+        const [resUS, resCN] = await Promise.all([
+          fetchPicks('US'),
+          fetchPicks('CN'),
+        ])
+        if (resUS.data.success && resUS.data.data.length > 0) {
+          customPicksUS.value = resUS.data.data
+        }
+        if (resCN.data.success && resCN.data.data.length > 0) {
+          customPicksCN.value = resCN.data.data
+        }
+        // 同步到 localStorage
+        localStorage.setItem(CUSTOM_PICKS_KEY, JSON.stringify({
+          US: customPicksUS.value,
+          CN: customPicksCN.value,
+        }))
+      } catch {
+        // fallback: 从 localStorage 加载
+        loadCustomPicks()
+      }
+
+      // 3. 加载主题偏好
+      try {
+        const res = await fetchPreferences()
+        if (res.data.success && res.data.data.theme === 'dark') {
+          isDark.value = true
+          document.documentElement.setAttribute('data-theme', 'dark')
+        }
+      } catch { /* localStorage 已经处理了主题 */ }
 
       // 默认展示茅台行情
       searchQuery.value = '600519'
@@ -459,12 +546,26 @@ export default {
         US: customPicksUS.value,
         CN: customPicksCN.value,
       }))
+      // 异步同步到 MySQL
+      if (apiAvailable.value) {
+        for (const pick of customPicksUS.value) {
+          apiAddPick(pick.symbol, pick.name, 'US').catch(() => {})
+        }
+        for (const pick of customPicksCN.value) {
+          apiAddPick(pick.symbol, pick.name, 'CN').catch(() => {})
+        }
+      }
     }
 
     function removeCustomPick(idx) {
       const list = market.value === 'US' ? customPicksUS : customPicksCN
+      const removed = list.value[idx]
       list.value.splice(idx, 1)
       saveCustomPicks()
+      // 尝试从 MySQL 删除
+      if (apiAvailable.value && removed && removed.id) {
+        apiRemovePick(removed.id).catch(() => {})
+      }
     }
 
     function confirmAddPick() {
@@ -474,7 +575,6 @@ export default {
         name: addPickName.value.trim() || addPickSymbol.value.trim(),
       }
       const list = market.value === 'US' ? customPicksUS : customPicksCN
-      // Avoid duplicates
       if (!list.value.some(s => s.symbol === newPick.symbol)) {
         list.value.push(newPick)
         saveCustomPicks()
@@ -664,15 +764,31 @@ export default {
 
     // --- Watchlist ---
     function saveWatchlist() {
+      // 始终写 localStorage（离线可用）
       localStorage.setItem(WATCHLIST_KEY, JSON.stringify(watchlist.value))
+      // 尝试同步到 MySQL（静默失败，降级到 localStorage）
+      if (apiAvailable.value) {
+        const symbols = watchlist.value.map(s => {
+          apiAddWatchlist(s.symbol, s.name || s.symbol, s.market || 'CN').catch(() => {})
+          return s.symbol
+        })
+      }
     }
 
     function toggleWatchlist() {
       if (!selectedStock.value) return
       if (isInWatchlist.value) {
         watchlist.value = watchlist.value.filter(s => s.symbol !== selectedStock.value.symbol)
+        // 尝试从 MySQL 删除
+        if (apiAvailable.value) {
+          apiRemoveWatchlist(selectedStock.value.symbol).catch(() => {})
+        }
       } else {
         watchlist.value.unshift({ ...selectedStock.value })
+        // 尝试写入 MySQL
+        if (apiAvailable.value) {
+          apiAddWatchlist(selectedStock.value.symbol, selectedStock.value.name, selectedStock.value.market || 'CN').catch(() => {})
+        }
       }
       saveWatchlist()
     }
@@ -731,6 +847,19 @@ export default {
       return num.toLocaleString('zh-CN')
     }
 
+    // --- Login / Logout ---
+    function onLoginSuccess(user) {
+      loggedInUser.value = user
+    }
+
+    function handleLogout() {
+      loggedInUser.value = null
+      localStorage.removeItem('jwt-token')
+      localStorage.removeItem('api-token')
+      // 刷新页面让 axios 实例重建 header
+      window.location.reload()
+    }
+
     return {
       market, searchQuery, selectedStock, watchlist, history,
       loading, historyLoading, error, retryAvailable,
@@ -745,6 +874,7 @@ export default {
       handleQuickSearch, handleWatchlistClick, handleLimitUpSelect,
       toggleTheme, toggleWatchlist, removeFromWatchlist, refreshWatchlist,
       removeCustomPick, confirmAddPick,
+      showLogin, loggedInUser, onLoginSuccess, handleLogout,
     }
   },
 }

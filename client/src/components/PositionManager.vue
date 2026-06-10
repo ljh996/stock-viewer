@@ -71,6 +71,7 @@
 
 <script>
 import { ref, computed, onMounted } from 'vue'
+import { fetchPortfolio, savePortfolio as apiSavePortfolio, addPortfolioAction as apiAddPortfolioAction } from '../api/user.js'
 
 export default {
   name: 'PositionManager',
@@ -82,6 +83,7 @@ export default {
     const actions = ref([])
     const actionType = ref('buy')
     const actionSymbol = ref('')
+    const apiAvailable = ref(true)
 
     const modeConfig = computed(() => {
       const configs = {
@@ -112,6 +114,9 @@ export default {
 
     function saveMode() {
       localStorage.setItem('pm-mode', currentMode.value)
+      if (apiAvailable.value) {
+        apiSavePortfolio({ current_mode: currentMode.value, year_stock_count: yearStockCount.value, month_trade_count: monthTradeCount.value, current_holding: currentHolding.value }).catch(() => {})
+      }
     }
 
     function addAction() {
@@ -134,14 +139,49 @@ export default {
         currentHolding.value = Math.max(0, currentHolding.value - 1)
       }
 
+      // 写 localStorage
       localStorage.setItem('pm-actions', JSON.stringify(actions.value))
       localStorage.setItem('pm-yearCount', yearStockCount.value)
       localStorage.setItem('pm-monthCount', monthTradeCount.value)
       localStorage.setItem('pm-holding', currentHolding.value)
+
+      // 同步到 MySQL
+      if (apiAvailable.value) {
+        apiAddPortfolioAction(actionType.value, actionSymbol.value.trim().toUpperCase(), dateStr).catch(() => {})
+        apiSavePortfolio({ current_mode: currentMode.value, year_stock_count: yearStockCount.value, month_trade_count: monthTradeCount.value, current_holding: currentHolding.value }).catch(() => {})
+      }
       actionSymbol.value = ''
     }
 
-    onMounted(() => {
+    onMounted(async () => {
+      // 尝试从 MySQL 加载
+      try {
+        const res = await fetchPortfolio()
+        if (res.data.success && res.data.data.portfolio) {
+          const p = res.data.data.portfolio
+          currentMode.value = p.current_mode || 'empty'
+          yearStockCount.value = p.year_stock_count || 0
+          monthTradeCount.value = p.month_trade_count || 0
+          currentHolding.value = p.current_holding || 0
+          if (res.data.data.actions && res.data.data.actions.length > 0) {
+            actions.value = res.data.data.actions.map(a => ({
+              type: a.type,
+              symbol: a.symbol,
+              date: a.action_date,
+            }))
+          }
+          // 同步到 localStorage
+          localStorage.setItem('pm-mode', currentMode.value)
+          localStorage.setItem('pm-actions', JSON.stringify(actions.value))
+          localStorage.setItem('pm-yearCount', yearStockCount.value)
+          localStorage.setItem('pm-monthCount', monthTradeCount.value)
+          localStorage.setItem('pm-holding', currentHolding.value)
+          return // 加载成功
+        }
+      } catch { /* fallback to localStorage */ }
+      apiAvailable.value = false
+
+      // fallback: 从 localStorage 加载
       const saved = localStorage.getItem('pm-mode')
       if (saved) currentMode.value = saved
       const savedActions = localStorage.getItem('pm-actions')

@@ -1,9 +1,49 @@
 import axios from 'axios'
 
+// 读取 API Token（可从 localStorage 覆盖）
+const API_TOKEN = localStorage.getItem('api-token') || 'stock-viewer-default-token'
+const JWT_TOKEN = localStorage.getItem('jwt-token')
+
 const api = axios.create({
   baseURL: '/api',
   timeout: 15000,
+  headers: {
+    'x-api-token': API_TOKEN,
+    ...(JWT_TOKEN ? { 'Authorization': `Bearer ${JWT_TOKEN}` } : {}),
+  },
 })
+
+// 暴露实例给 LoginDialog 等组件使用
+if (typeof window !== 'undefined') {
+  window.__axiosInstance = api
+}
+
+// 请求拦截器：自动附加 JWT token
+api.interceptors.request.use(config => {
+  const jwt = localStorage.getItem('jwt-token')
+  if (jwt) {
+    config.headers['Authorization'] = `Bearer ${jwt}`
+  }
+  config.headers['x-api-token'] = localStorage.getItem('api-token') || 'stock-viewer-default-token'
+  return config
+})
+
+// 响应拦截器：401 时触发登录事件（但不弹 alert）
+let onUnauthorized = null
+export function setOnUnauthorized(cb) {
+  onUnauthorized = cb
+}
+api.interceptors.response.use(
+  res => res,
+  err => {
+    if (err.response?.status === 401 && err.config?.url?.startsWith('/user/')) {
+      // 用户数据接口 401 → 可能是 token 过期
+      localStorage.removeItem('jwt-token')
+      if (onUnauthorized) onUnauthorized()
+    }
+    return Promise.reject(err)
+  }
+)
 
 // 美股
 export function fetchUSStock(symbol) {

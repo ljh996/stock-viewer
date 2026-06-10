@@ -7,12 +7,45 @@ const { URL } = require('url')
 const net = require('net')
 const tls = require('tls')
 const path = require('path')
+const { initCache, getOrFetch } = require('./cache')
+const { initDB } = require('./db')
+const userRoutes = require('./routes/user')
+const authRoutes = require('./routes/auth')
+const { requireToken, createRateLimiter, checkTokenQuota } = require('./middleware/auth')
 
 const app = express()
 const PORT = 3000
 
 app.use(cors())
 app.use(express.json())
+
+// 用户数据 API（MySQL 持久化）
+app.use('/api/user', userRoutes)
+
+// 用户认证 API（JWT 注册/登录）
+app.use('/api/auth', authRoutes)
+
+// 阶段 1: API Token 保护 AI 接口（防刷 DeepSeek 额度）
+app.use('/api/ai', requireToken)
+
+// 阶段 3: Rate Limiting（在 Token 验证之后）
+// AI 接口限流：每分钟 20 次
+const aiRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 20, prefix: 'ratelimit:ai:' })
+const quoteRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 60, prefix: 'ratelimit:quote:' })
+const searchRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 30, prefix: 'ratelimit:search:' })
+
+app.use('/api/ai', aiRateLimit)
+app.use('/api/limit-up/analysis', aiRateLimit)
+app.use('/api/stock', quoteRateLimit)
+app.use('/api/search', searchRateLimit)
+app.use('/api/limit-up/today', quoteRateLimit)
+
+// Token 每日配额检查（在 requireToken 之后，统计 AI 接口每日调用次数）
+app.use('/api/ai', checkTokenQuota)
+app.use('/api/limit-up/analysis', checkTokenQuota)
+
+// /api/limit-up/analysis 也调 DeepSeek，单独保护
+app.use('/api/limit-up/analysis', requireToken)
 
 // 生产环境：托管前端静态文件
 app.use(express.static(path.join(__dirname, '../client/dist')))
@@ -166,46 +199,42 @@ const usStockDB = [
   { symbol: 'TQQQ', name: 'ProShares UltraPro QQQ (3倍做多纳指)' }, { symbol: 'SQQQ', name: 'ProShares UltraPro Short QQQ (3倍做空纳指)' },
 ]
 
-// 美股行情（新浪财经 gb_ 接口）
+// 美股行情（新浪财经 gb_ 接口，缓存 30 秒）
 app.get('/api/stock/us/:symbol', async (req, res) => {
   try {
     const symbol = String(req.params.symbol).toUpperCase()
-    const sinaSymbol = `gb_${symbol.toLowerCase()}`
 
-    const { ok, body } = await httpGet(
-      `https://hq.sinajs.cn/list=${sinaSymbol}`,
-      { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
-    )
-    if (!ok) throw new Error('请求新浪接口失败')
+    const data = await getOrFetch(`stock:us:${symbol}`, async () => {
+      const sinaSymbol = `gb_${symbol.toLowerCase()}`
 
-    const match = body.match(/"([^"]+)"/)
-    if (!match) {
-      return res.json({ success: false, error: '未找到该股票，请检查代码是否正确' })
-    }
+      const { ok, body } = await httpGet(
+        `https://hq.sinajs.cn/list=${sinaSymbol}`,
+        { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
+      )
+      if (!ok) throw new Error('请求新浪接口失败')
 
-    const parts = match[1].split(',')
-    if (!parts || parts.length < 7) {
-      return res.json({ success: false, error: '股票数据格式异常' })
-    }
+      const match = body.match(/"([^"]+)"/)
+      if (!match) throw new Error('未找到该股票，请检查代码是否正确')
 
-    // 新浪 gb_ 格式: name, price, change%, time, $change, low, high, pre_low, pre_high, 52w_low, volume, ...
-    const name = parts[0] || symbol
-    const price = parseFloat(parts[1]) || 0
-    const changeDollar = parts.length > 4 ? (parseFloat(parts[4]) || 0) : 0
-    const prevClose = parts.length > 26 ? (parseFloat(parts[26]) || 0) : price - changeDollar
-    const change = price - prevClose
-    const changePercent = prevClose > 0 ? (change / prevClose) * 100 : (parseFloat(parts[2]) || 0)
-    const dayLow = parseFloat(parts[5]) || Math.min(price, prevClose)
-    const dayHigh = parseFloat(parts[6]) || Math.max(price, prevClose)
-    const volume = parseInt(parts[10]) || 0
+      const parts = match[1].split(',')
+      if (!parts || parts.length < 7) throw new Error('股票数据格式异常')
 
-    // 用实时价校正 range
-    const low = Math.min(dayLow, price)
-    const high = Math.max(dayHigh, price)
+      // 新浪 gb_ 格式: name, price, change%, time, $change, low, high, pre_low, pre_high, 52w_low, volume, ...
+      const name = parts[0] || symbol
+      const price = parseFloat(parts[1]) || 0
+      const changeDollar = parts.length > 4 ? (parseFloat(parts[4]) || 0) : 0
+      const prevClose = parts.length > 26 ? (parseFloat(parts[26]) || 0) : price - changeDollar
+      const change = price - prevClose
+      const changePercent = prevClose > 0 ? (change / prevClose) * 100 : (parseFloat(parts[2]) || 0)
+      const dayLow = parseFloat(parts[5]) || Math.min(price, prevClose)
+      const dayHigh = parseFloat(parts[6]) || Math.max(price, prevClose)
+      const volume = parseInt(parts[10]) || 0
 
-    res.json({
-      success: true,
-      data: {
+      // 用实时价校正 range
+      const low = Math.min(dayLow, price)
+      const high = Math.max(dayHigh, price)
+
+      return {
         symbol, name, price,
         change: parseFloat(change.toFixed(2)),
         changePercent: parseFloat(changePercent.toFixed(2)),
@@ -214,39 +243,46 @@ app.get('/api/stock/us/:symbol', async (req, res) => {
         previousClose: parseFloat(prevClose.toFixed(2)),
         currency: 'USD',
         market: 'US',
-      },
-    })
+      }
+    }, 30) // 缓存 30 秒
+
+    res.json({ success: true, data })
   } catch (err) {
+    // 数据错误（未找到/格式异常）→ 不缓存，返回成功:false
+    if (err.message.includes('未找到') || err.message.includes('格式异常')) {
+      return res.json({ success: false, error: err.message })
+    }
+    // 网络错误 → 500
     console.error('美股行情请求失败:', err.message)
     res.status(500).json({ success: false, error: `获取美股数据失败: ${err.message}` })
   }
 })
 
-// 美股历史数据（新浪 US K-line 接口）
+// 美股历史数据（新浪 US K-line 接口，缓存 5 分钟）
 app.get('/api/stock/us/:symbol/history', async (req, res) => {
   try {
     const symbol = String(req.params.symbol).toUpperCase()
 
-    const { ok, body } = await httpGet(
-      `https://stock.finance.sina.com.cn/usstock/api/json_v2.php/US_MinKService.getDailyK?symbol=${symbol}`,
-      { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
-    )
-    if (!ok) {
-      return res.status(500).json({ success: false, error: '获取美股历史数据失败' })
-    }
+    const history = await getOrFetch(`stock:us:${symbol}:history`, async () => {
+      const { ok, body } = await httpGet(
+        `https://stock.finance.sina.com.cn/usstock/api/json_v2.php/US_MinKService.getDailyK?symbol=${symbol}`,
+        { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
+      )
+      if (!ok) throw new Error('获取美股历史数据失败')
 
-    let data
-    try { data = JSON.parse(body) } catch { return res.json({ success: true, data: [] }) }
-    if (!Array.isArray(data)) return res.json({ success: true, data: [] })
+      let data
+      try { data = JSON.parse(body) } catch { return [] }
+      if (!Array.isArray(data)) return []
 
-    const history = data.slice(-30).map((item) => ({
-      date: item.d || item.day,
-      open: parseFloat(item.o || item.open),
-      high: parseFloat(item.h || item.high),
-      low: parseFloat(item.l || item.low),
-      close: parseFloat(item.c || item.close),
-      volume: parseInt(item.v || item.volume) || 0,
-    })).filter((d) => d.close > 0)
+      return data.slice(-30).map((item) => ({
+        date: item.d || item.day,
+        open: parseFloat(item.o || item.open),
+        high: parseFloat(item.h || item.high),
+        low: parseFloat(item.l || item.low),
+        close: parseFloat(item.c || item.close),
+        volume: parseInt(item.v || item.volume) || 0,
+      })).filter((d) => d.close > 0)
+    }, 300) // 缓存 5 分钟
 
     res.json({ success: true, data: history })
   } catch (err) {
@@ -255,47 +291,50 @@ app.get('/api/stock/us/:symbol/history', async (req, res) => {
   }
 })
 
-// 美股搜索（内置热门股票列表 + 新浪 suggest 补充）
+// 美股搜索（内置热门股票列表 + 新浪 suggest 补充，缓存 1 小时）
 app.get('/api/search/us/:keyword', async (req, res) => {
   try {
     const keyword = req.params.keyword.trim()
     const kwUpper = keyword.toUpperCase()
 
-    // 1. 先从内置列表匹配
-    let results = usStockDB.filter(s =>
-      s.symbol.includes(kwUpper) || s.name.toUpperCase().includes(kwUpper)
-    )
+    const results = await getOrFetch(`search:us:${kwUpper}`, async () => {
+      // 1. 先从内置列表匹配
+      let results = usStockDB.filter(s =>
+        s.symbol.includes(kwUpper) || s.name.toUpperCase().includes(kwUpper)
+      )
 
-    // 2. 如果没找到，尝试新浪 suggest（type=12 为美股）
-    if (results.length === 0) {
-      try {
-        const { ok, body } = await httpGet(
-          `https://suggest3.sinajs.cn/suggest/type=12&key=${encodeURIComponent(keyword)}`,
-          { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
-        )
-        if (ok && body) {
-          const m = body.match(/"([^"]+)"/)
-          if (m) {
-            const items = m[1].split(';')
-            for (const item of items) {
-              const fields = item.split(',')
-              if (fields.length >= 4) {
-                const name = fields[0]
-                const code = fields[2]
-                if (code && name) {
-                  results.push({ symbol: code, name })
+      // 2. 如果没找到，尝试新浪 suggest（type=12 为美股）
+      if (results.length === 0) {
+        try {
+          const { ok, body } = await httpGet(
+            `https://suggest3.sinajs.cn/suggest/type=12&key=${encodeURIComponent(keyword)}`,
+            { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
+          )
+          if (ok && body) {
+            const m = body.match(/"([^"]+)"/)
+            if (m) {
+              const items = m[1].split(';')
+              for (const item of items) {
+                const fields = item.split(',')
+                if (fields.length >= 4) {
+                  const name = fields[0]
+                  const code = fields[2]
+                  if (code && name) {
+                    results.push({ symbol: code, name })
+                  }
                 }
               }
             }
           }
+        } catch (e) {
+          console.log('新浪 suggest 美股搜索失败:', e.message)
         }
-      } catch (e) {
-        console.log('新浪 suggest 美股搜索失败:', e.message)
       }
-    }
 
-    // 3. 提示用户可输入的常见股票
-    return res.json({ success: true, data: results.slice(0, 10) })
+      return results.slice(0, 10)
+    }, 3600) // 缓存 1 小时
+
+    return res.json({ success: true, data: results })
   } catch (err) {
     console.error('美股搜索失败:', err.message)
     res.status(500).json({ success: false, error: `搜索失败: ${err.message}` })
@@ -330,92 +369,88 @@ app.get('/api/search/cn/:keyword', async (req, res) => {
     const kw = req.params.keyword.trim()
     const kwLower = kw.toLowerCase()
 
-    // 1. 先按代码精确匹配
-    let results = cnStockDB.filter(s => s.symbol === kwLower)
-    // 2. 再按名称模糊匹配
-    if (results.length === 0) {
-      results = cnStockDB.filter(s => s.name.includes(kw) || s.symbol.includes(kwLower))
-    }
+    const results = await getOrFetch(`search:cn:${kwLower}`, async () => {
+      // 1. 先按代码精确匹配
+      let results = cnStockDB.filter(s => s.symbol === kwLower)
+      // 2. 再按名称模糊匹配
+      if (results.length === 0) {
+        results = cnStockDB.filter(s => s.name.includes(kw) || s.symbol.includes(kwLower))
+      }
 
-    // 3. 本地没有则请求新浪 suggest API 实时搜索
-    if (results.length === 0) {
-      try {
-        const { ok, body } = await httpGet(
-          `https://suggest3.sinajs.cn/suggest/type=11&key=${encodeURIComponent(kw)}`,
-          { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
-        )
-        if (ok && body) {
-          // 解析新浪 suggest 返回数据
-          // 格式: var suggestvalue="苏州银行,11,002966,sz002966,...;..."
-          const m = body.match(/"([^"]+)"/)
-          if (m) {
-            const items = m[1].split(';')
-            for (const item of items) {
-              const fields = item.split(',')
-              if (fields.length >= 4) {
-                const name = fields[0]
-                const code = fields[2]
-                if (code && /^\d{6}$/.test(code) && name) {
-                  results.push({ symbol: code, name })
+      // 3. 本地没有则请求新浪 suggest API 实时搜索
+      if (results.length === 0) {
+        try {
+          const { ok, body } = await httpGet(
+            `https://suggest3.sinajs.cn/suggest/type=11&key=${encodeURIComponent(kw)}`,
+            { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
+          )
+          if (ok && body) {
+            const m = body.match(/"([^"]+)"/)
+            if (m) {
+              const items = m[1].split(';')
+              for (const item of items) {
+                const fields = item.split(',')
+                if (fields.length >= 4) {
+                  const name = fields[0]
+                  const code = fields[2]
+                  if (code && /^\d{6}$/.test(code) && name) {
+                    results.push({ symbol: code, name })
+                  }
                 }
               }
             }
           }
+        } catch (e) {
+          console.log('新浪 suggest 搜索失败:', e.message)
         }
-      } catch (e) {
-        console.log('新浪 suggest 搜索失败:', e.message)
       }
-    }
 
-    // 4. 如果是纯数字但没搜到，当未知代码处理
-    if (results.length === 0 && /^\d{6}$/.test(kw)) {
-      results = [{ symbol: kw, name: '未知股票' }]
-    }
+      // 4. 如果是纯数字但没搜到，当未知代码处理
+      if (results.length === 0 && /^\d{6}$/.test(kw)) {
+        results = [{ symbol: kw, name: '未知股票' }]
+      }
 
-    res.json({ success: true, data: results.slice(0, 10) })
+      return results.slice(0, 10)
+    }, 3600) // 缓存 1 小时
+
+    res.json({ success: true, data: results })
   } catch (err) {
     res.status(500).json({ success: false, error: `搜索失败: ${err.message}` })
   }
 })
 
+// A 股实时行情（新浪财经，缓存 30 秒）
 app.get('/api/stock/cn/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params
-    const prefix = symbol.startsWith('6') ? 'sh' : 'sz'
-    const sinaSymbol = `${prefix}${symbol}`
 
-    const { ok, body } = await httpGet(
-      `https://hq.sinajs.cn/list=${sinaSymbol}`,
-      { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
-    )
+    const data = await getOrFetch(`stock:cn:${symbol}`, async () => {
+      const prefix = symbol.startsWith('6') ? 'sh' : 'sz'
+      const sinaSymbol = `${prefix}${symbol}`
 
-    if (!ok) {
-      return res.status(500).json({ success: false, error: '获取A股数据失败' })
-    }
+      const { ok, body } = await httpGet(
+        `https://hq.sinajs.cn/list=${sinaSymbol}`,
+        { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
+      )
+      if (!ok) throw new Error('获取A股数据失败')
 
-    const match = body.match(/"([^"]+)"/)
-    if (!match) {
-      return res.json({ success: false, error: '未找到该股票数据，请检查股票代码是否正确' })
-    }
+      const match = body.match(/"([^"]+)"/)
+      if (!match) throw new Error('未找到该股票数据，请检查股票代码是否正确')
 
-    const parts = match[1].split(',')
-    if (!parts || parts.length < 3) {
-      return res.json({ success: false, error: '股票数据格式异常，该代码可能无效' })
-    }
+      const parts = match[1].split(',')
+      if (!parts || parts.length < 3) throw new Error('股票数据格式异常，该代码可能无效')
 
-    const name = parts[0] || '未知'
-    const open = parseFloat(parts[1]) || 0
-    const prevClose = parseFloat(parts[2]) || 0
-    const price = parseFloat(parts[3]) || prevClose || open
-    const high = parseFloat(parts[4]) || price
-    const low = parseFloat(parts[5]) || price
-    const volume = parseFloat(parts[8]) || 0
-    const change = price - prevClose
-    const changePercent = prevClose > 0 ? (change / prevClose) * 100 : 0
+      const name = parts[0] || '未知'
+      const open = parseFloat(parts[1]) || 0
+      const prevClose = parseFloat(parts[2]) || 0
+      const price = parseFloat(parts[3]) || prevClose || open
+      const high = parseFloat(parts[4]) || price
+      const low = parseFloat(parts[5]) || price
+      const volume = parseFloat(parts[8]) || 0
+      const change = price - prevClose
+      const changePercent = prevClose > 0 ? (change / prevClose) * 100 : 0
 
-    res.json({
-      success: true,
-      data: {
+      return {
         symbol, name, price,
         change: parseFloat(change.toFixed(2)),
         changePercent: parseFloat(changePercent.toFixed(2)),
@@ -423,136 +458,138 @@ app.get('/api/stock/cn/:symbol', async (req, res) => {
         previousClose: prevClose,
         currency: 'CNY',
         market: 'CN',
-      },
-    })
+      }
+    }, 30) // 缓存 30 秒
+
+    res.json({ success: true, data })
   } catch (err) {
+    if (err.message.includes('未找到') || err.message.includes('格式异常') || err.message.includes('无效')) {
+      return res.json({ success: false, error: err.message })
+    }
     console.error('A股行情请求失败:', err.message)
     res.status(500).json({ success: false, error: `获取A股数据失败: ${err.message}` })
   }
 })
 
-// A股信号参数自动填充（换手率、跌幅等）
+// A股信号参数自动填充（换手率、跌幅等，缓存 5 分钟）
 app.get('/api/stock/cn/:symbol/auto-fill', async (req, res) => {
   try {
     const { symbol } = req.params
-    const prefix = symbol.startsWith('6') ? 'sh' : 'sz'
-    const sinaSymbol = `${prefix}${symbol}`
 
-    // 1. 获取换手率（腾讯接口）
-    let turnoverRate = null
-    try {
-      const { ok, body } = await httpGetWithTimeout(
-        `https://qt.gtimg.cn/q=${sinaSymbol}`,
-        { headers: { 'Referer': 'https://qt.gtimg.cn' }, encoding: 'gbk' }, 8000
-      )
-      if (ok && body) {
-        // Tencent格式: v_sz002966="...~...~...", 换手率在字段38
-        const m = body.match(/"([^"]+)"/)
-        if (m) {
-          const fields = m[1].split('~')
-          if (fields.length > 39 && fields[38] && parseFloat(fields[38]) > 0) {
-            turnoverRate = parseFloat(fields[38])
+    const data = await getOrFetch(`cn:auto-fill:${symbol}`, async () => {
+      const prefix = symbol.startsWith('6') ? 'sh' : 'sz'
+      const sinaSymbol = `${prefix}${symbol}`
+
+      // 1. 获取换手率（腾讯接口）
+      let turnoverRate = null
+      try {
+        const { ok, body } = await httpGetWithTimeout(
+          `https://qt.gtimg.cn/q=${sinaSymbol}`,
+          { headers: { 'Referer': 'https://qt.gtimg.cn' }, encoding: 'gbk' }, 8000
+        )
+        if (ok && body) {
+          const m = body.match(/"([^"]+)"/)
+          if (m) {
+            const fields = m[1].split('~')
+            if (fields.length > 39 && fields[38] && parseFloat(fields[38]) > 0) {
+              turnoverRate = parseFloat(fields[38])
+            }
           }
         }
+      } catch (e) {
+        console.log('腾讯换手率获取失败:', e.message)
       }
-    } catch (e) {
-      console.log('腾讯换手率获取失败:', e.message)
-    }
 
-    // 2. 获取120日历史数据，计算从最高点跌幅
-    let dropFromHigh = null
-    try {
-      const { ok, body } = await httpGetWithTimeout(
-        `https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=${sinaSymbol}&scale=240&ma=no&datalen=120`,
-        { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 10000
-      )
-      if (ok) {
-        let data
-        try { data = JSON.parse(body) } catch { data = [] }
-        if (Array.isArray(data) && data.length > 0) {
-          const currentPrice = parseFloat(data[data.length - 1].close) || 0
-          let maxPrice = 0
-          for (const d of data) {
-            const h = parseFloat(d.high) || 0
-            if (h > maxPrice) maxPrice = h
-          }
-          if (maxPrice > 0 && currentPrice > 0) {
-            dropFromHigh = parseFloat(((maxPrice - currentPrice) / maxPrice * 100).toFixed(1))
+      // 2. 获取120日历史数据，计算从最高点跌幅
+      let dropFromHigh = null
+      try {
+        const { ok, body } = await httpGetWithTimeout(
+          `https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=${sinaSymbol}&scale=240&ma=no&datalen=120`,
+          { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 10000
+        )
+        if (ok) {
+          let data
+          try { data = JSON.parse(body) } catch { data = [] }
+          if (Array.isArray(data) && data.length > 0) {
+            const currentPrice = parseFloat(data[data.length - 1].close) || 0
+            let maxPrice = 0
+            for (const d of data) {
+              const h = parseFloat(d.high) || 0
+              if (h > maxPrice) maxPrice = h
+            }
+            if (maxPrice > 0 && currentPrice > 0) {
+              dropFromHigh = parseFloat(((maxPrice - currentPrice) / maxPrice * 100).toFixed(1))
+            }
           }
         }
+      } catch (e) {
+        console.log('历史数据获取失败:', e.message)
       }
-    } catch (e) {
-      console.log('历史数据获取失败:', e.message)
-    }
 
-    // 3. 获取上证指数120日数据，计算大盘跌幅
-    let marketDrop = null
-    try {
-      const { ok, body } = await httpGetWithTimeout(
-        'https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=sh000001&scale=240&ma=no&datalen=120',
-        { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 10000
-      )
-      if (ok) {
-        let data
-        try { data = JSON.parse(body) } catch { data = [] }
-        if (Array.isArray(data) && data.length > 0) {
-          const currentIndex = parseFloat(data[data.length - 1].close) || 0
-          let maxIndex = 0
-          for (const d of data) {
-            const h = parseFloat(d.high) || 0
-            if (h > maxIndex) maxIndex = h
-          }
-          if (maxIndex > 0 && currentIndex > 0) {
-            marketDrop = parseFloat(((maxIndex - currentIndex) / maxIndex * 100).toFixed(1))
+      // 3. 获取上证指数120日数据，计算大盘跌幅
+      let marketDrop = null
+      try {
+        const { ok, body } = await httpGetWithTimeout(
+          'https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=sh000001&scale=240&ma=no&datalen=120',
+          { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 10000
+        )
+        if (ok) {
+          let data
+          try { data = JSON.parse(body) } catch { data = [] }
+          if (Array.isArray(data) && data.length > 0) {
+            const currentIndex = parseFloat(data[data.length - 1].close) || 0
+            let maxIndex = 0
+            for (const d of data) {
+              const h = parseFloat(d.high) || 0
+              if (h > maxIndex) maxIndex = h
+            }
+            if (maxIndex > 0 && currentIndex > 0) {
+              marketDrop = parseFloat(((maxIndex - currentIndex) / maxIndex * 100).toFixed(1))
+            }
           }
         }
+      } catch (e) {
+        console.log('指数数据获取失败:', e.message)
       }
-    } catch (e) {
-      console.log('指数数据获取失败:', e.message)
-    }
 
-    res.json({
-      success: true,
-      data: {
-        turnoverRate,
-        dropFromHigh,
-        marketDrop,
-        isNewStock: false,
-      },
-    })
+      return { turnoverRate, dropFromHigh, marketDrop, isNewStock: false }
+    }, 300) // 缓存 5 分钟
+
+    res.json({ success: true, data })
   } catch (err) {
     console.error('自动填充失败:', err.message)
     res.status(500).json({ success: false, error: `自动填充失败: ${err.message}` })
   }
 })
 
+// A 股历史 K 线（新浪财经，缓存 5 分钟）
 app.get('/api/stock/cn/:symbol/history', async (req, res) => {
   try {
     const { symbol } = req.params
-    const prefix = symbol.startsWith('6') ? 'sh' : 'sz'
-    const sinaSymbol = `${prefix}${symbol}`
 
-    const { ok, body } = await httpGet(
-      `https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=${sinaSymbol}&scale=240&ma=no&datalen=30`,
-      { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
-    )
+    const history = await getOrFetch(`stock:cn:${symbol}:history`, async () => {
+      const prefix = symbol.startsWith('6') ? 'sh' : 'sz'
+      const sinaSymbol = `${prefix}${symbol}`
 
-    if (!ok) {
-      return res.status(500).json({ success: false, error: '获取A股历史数据失败' })
-    }
+      const { ok, body } = await httpGet(
+        `https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=${sinaSymbol}&scale=240&ma=no&datalen=30`,
+        { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
+      )
+      if (!ok) throw new Error('获取A股历史数据失败')
 
-    let data
-    try { data = JSON.parse(body) } catch { return res.json({ success: true, data: [] }) }
-    if (!Array.isArray(data)) return res.json({ success: true, data: [] })
+      let data
+      try { data = JSON.parse(body) } catch { return [] }
+      if (!Array.isArray(data)) return []
 
-    const history = data.map((item) => ({
-      date: item.day,
-      open: parseFloat(item.open),
-      high: parseFloat(item.high),
-      low: parseFloat(item.low),
-      close: parseFloat(item.close),
-      volume: parseFloat(item.volume),
-    }))
+      return data.map((item) => ({
+        date: item.day,
+        open: parseFloat(item.open),
+        high: parseFloat(item.high),
+        low: parseFloat(item.low),
+        close: parseFloat(item.close),
+        volume: parseFloat(item.volume),
+      }))
+    }, 300) // 缓存 5 分钟
 
     res.json({ success: true, data: history })
   } catch (err) {
@@ -561,141 +598,153 @@ app.get('/api/stock/cn/:symbol/history', async (req, res) => {
   }
 })
 
-// ==================== 涨停板数据 ====================
+// ==================== 涨停板数据（缓存 60 秒） ====================
 
 app.get('/api/limit-up/today', async (req, res) => {
-  // 尝试 Python AKShare 接口
   try {
-    const { ok, body } = await httpGetWithTimeout(`${PYTHON_API}/api/limit-up/today`, {}, 30000)
-    if (ok) {
-      const data = JSON.parse(body)
-      if (data && data.success && data.data) {
-        return res.json(data)
+    const data = await getOrFetch('limitup:today', async () => {
+      // 尝试 Python AKShare 接口
+      try {
+        const { ok, body } = await httpGetWithTimeout(`${PYTHON_API}/api/limit-up/today`, {}, 30000)
+        if (ok) {
+          const data = JSON.parse(body)
+          if (data && data.success && data.data) return data.data
+        }
+      } catch (e) {
+        console.log('Python 涨停服务不可用，降级到新浪:', e.message)
       }
-    }
-  } catch (e) {
-    console.log('Python 涨停服务不可用，降级到新浪:', e.message)
-  }
 
-  // 优先用东方财富专门的涨停API（数据更全）
-  try {
-    const today = new Date().toISOString().slice(0, 10)
-    const eastStocks = await getLimitUpByDate(today)
-    if (eastStocks.length > 0) {
-      return res.json({ success: true, data: eastStocks })
-    }
-  } catch (e) {
-    console.log('东方财富涨停接口失败:', e.message)
-  }
-
-  // 降级：用新浪接口筛选涨停股（扩大取数范围，避免截断）
-  let stocks = []
-  try {
-    const { ok: ok2, body: body2 } = await httpGetWithTimeout(
-      'https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=5000&sort=changepercent&asc=0&node=hs_a&symbol=&_s_r_a=page',
-      { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 15000
-    )
-    if (ok2) {
-      let data
-      try { data = JSON.parse(body2) } catch { data = [] }
-      if (Array.isArray(data)) {
-        stocks = data
-          .filter(s => parseFloat(s.changepercent) >= 9.9)
-          .map(s => ({
-            symbol: s.code,
-            name: s.name,
-            price: parseFloat(s.trade),
-            change_percent: parseFloat(s.changepercent),
-            turnover_rate: parseFloat(s.turnoverratio || 0),
-            change_amount: parseFloat(s.pricechange || 0),
-            volume: parseFloat(s.volume || 0),
-            limit_up_count: 1,
-            score: null,
-            industry: null,
-          }))
+      // 优先用东方财富专门的涨停API（数据更全）
+      try {
+        const today = new Date().toISOString().slice(0, 10)
+        const eastStocks = await getLimitUpByDate(today)
+        if (eastStocks.length > 0) return eastStocks
+      } catch (e) {
+        console.log('东方财富涨停接口失败:', e.message)
       }
-    }
-  } catch (e) {
-    console.log('新浪接口降级失败:', e.message)
-  }
 
-  res.json({ success: true, data: stocks })
+      // 降级：用新浪接口筛选涨停股
+      let stocks = []
+      try {
+        const { ok: ok2, body: body2 } = await httpGetWithTimeout(
+          'https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=5000&sort=changepercent&asc=0&node=hs_a&symbol=&_s_r_a=page',
+          { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }, 15000
+        )
+        if (ok2) {
+          let data
+          try { data = JSON.parse(body2) } catch { data = [] }
+          if (Array.isArray(data)) {
+            stocks = data
+              .filter(s => parseFloat(s.changepercent) >= 9.9)
+              .map(s => ({
+                symbol: s.code, name: s.name, price: parseFloat(s.trade),
+                change_percent: parseFloat(s.changepercent),
+                turnover_rate: parseFloat(s.turnoverratio || 0),
+                change_amount: parseFloat(s.pricechange || 0),
+                volume: parseFloat(s.volume || 0),
+                limit_up_count: 1, score: null, industry: null,
+              }))
+          }
+        }
+      } catch (e) {
+        console.log('新浪接口降级失败:', e.message)
+      }
+
+      return stocks
+    }, 60) // 缓存 60 秒
+
+    res.json({ success: true, data })
+  } catch (err) {
+    console.error('涨停数据请求失败:', err.message)
+    res.status(500).json({ success: false, error: `获取涨停数据失败: ${err.message}` })
+  }
 })
 
-// 历史涨停数据
+// 历史涨停数据（缓存 1 小时）
 app.get('/api/limit-up/history', async (req, res) => {
   const { date } = req.query
   if (!date) {
     return res.status(400).json({ success: false, error: '请指定日期参数 date=YYYY-MM-DD' })
   }
 
-  // 尝试 Python AKShare
   try {
-    const { ok, body } = await httpGetWithTimeout(`${PYTHON_API}/api/limit-up/history?date=${date}`, {}, 30000)
-    if (ok) {
-      const data = JSON.parse(body)
-      if (data && data.success && data.data) {
-        return res.json(data)
+    const stocks = await getOrFetch(`limitup:history:${date}`, async () => {
+      // 尝试 Python AKShare
+      try {
+        const { ok, body } = await httpGetWithTimeout(`${PYTHON_API}/api/limit-up/history?date=${date}`, {}, 30000)
+        if (ok) {
+          const data = JSON.parse(body)
+          if (data && data.success && data.data) return data.data
+        }
+      } catch (e) {
+        console.log('Python 历史涨停不可用，降级到东方财富:', e.message)
       }
-    }
-  } catch (e) {
-    console.log('Python 历史涨停不可用，降级到东方财富:', e.message)
-  }
 
-  // 降级：东方财富 + 新浪
-  try {
-    const stocks = await getLimitUpByDate(date)
-    return res.json({ success: true, data: stocks })
-  } catch (e) {
-    console.log('历史涨停降级失败:', e.message)
-  }
+      // 降级：东方财富 + 新浪
+      try {
+        return await getLimitUpByDate(date)
+      } catch (e) {
+        console.log('历史涨停降级失败:', e.message)
+      }
 
-  res.json({ success: true, data: [] })
+      return []
+    }, 3600) // 缓存 1 小时
+
+    res.json({ success: true, data: stocks })
+  } catch (err) {
+    console.error('历史涨停请求失败:', err.message)
+    res.status(500).json({ success: false, error: `获取历史涨停数据失败: ${err.message}` })
+  }
 })
 
-// 涨停板块统计
+// 涨停板块统计（缓存 5 分钟）
 app.get('/api/limit-up/stats', async (req, res) => {
   const { date } = req.query
 
-  // 尝试 Python AKShare
   try {
-    const { ok, body } = await httpGetWithTimeout(`${PYTHON_API}/api/limit-up/stats?date=${date || ''}`, {}, 30000)
-    if (ok) {
-      const data = JSON.parse(body)
-      if (data && data.success && data.data) {
-        return res.json(data)
+    const stats = await getOrFetch(`limitup:stats:${date || 'today'}`, async () => {
+      // 尝试 Python AKShare
+      try {
+        const { ok, body } = await httpGetWithTimeout(`${PYTHON_API}/api/limit-up/stats?date=${date || ''}`, {}, 30000)
+        if (ok) {
+          const data = JSON.parse(body)
+          if (data && data.success && data.data) return data.data
+        }
+      } catch (e) {
+        console.log('Python 涨停统计不可用:', e.message)
       }
-    }
-  } catch (e) {
-    console.log('Python 涨停统计不可用:', e.message)
-  }
 
-  // 降级：获取当天数据后做简单统计
-  try {
-    const today = date || new Date().toISOString().slice(0, 10)
-    const stocks = await getLimitUpByDate(today)
-    // 按价格区间分组
-    const groups = {}
-    for (const s of stocks) {
-      const key = s.price < 10 ? '低价股 (<10元)' : s.price < 30 ? '中价股 (10-30元)' : '高价股 (>30元)'
-      if (!groups[key]) groups[key] = { industry: key, count: 0, stocks: [] }
-      groups[key].count++
-      groups[key].stocks.push(s)
-    }
-    const stats = Object.values(groups)
-    return res.json({ success: true, data: stats })
-  } catch (e) {
-    console.log('涨停统计降级失败:', e.message)
-  }
+      // 降级：获取当天数据后做简单统计
+      try {
+        const today = date || new Date().toISOString().slice(0, 10)
+        const stocks = await getLimitUpByDate(today)
+        const groups = {}
+        for (const s of stocks) {
+          const key = s.price < 10 ? '低价股 (<10元)' : s.price < 30 ? '中价股 (10-30元)' : '高价股 (>30元)'
+          if (!groups[key]) groups[key] = { industry: key, count: 0, stocks: [] }
+          groups[key].count++
+          groups[key].stocks.push(s)
+        }
+        return Object.values(groups)
+      } catch (e) {
+        console.log('涨停统计降级失败:', e.message)
+      }
 
-  res.json({ success: true, data: [] })
+      return []
+    }, 300) // 缓存 5 分钟
+
+    res.json({ success: true, data: stats })
+  } catch (err) {
+    console.error('涨停统计请求失败:', err.message)
+    res.status(500).json({ success: false, error: `获取涨停统计失败: ${err.message}` })
+  }
 })
 
-// ==================== DeepSeek AI 分析 ====================
+// ==================== DeepSeek AI 分析（结果缓存 1 小时，省 API 费用） ====================
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 
-// AI 个股健康检查
+// AI 个股健康检查（缓存 1 小时，按 symbol + market 去重）
 app.post('/api/ai/health-check', async (req, res) => {
   try {
     const stock = req.body
@@ -703,16 +752,19 @@ app.post('/api/ai/health-check', async (req, res) => {
       return res.status(400).json({ success: false, error: '缺少股票数据' })
     }
 
-    const changePercent = (stock.changePercent || 0).toFixed(2)
-    const dayRange = ((stock.high || 0) - (stock.low || 0)).toFixed(2)
-    const rangePct = stock.previousClose > 0
-      ? (((stock.high || 0) - (stock.low || 0)) / stock.previousClose * 100).toFixed(2)
-      : 'N/A'
-    const volumeStr = (stock.volume || 0) > 10000
-      ? (stock.volume / 10000).toFixed(0) + '万'
-      : (stock.volume || 0) + '手'
+    const result = await getOrFetch(
+      `ai:health:${stock.symbol}:${stock.market || 'CN'}`,
+      async () => {
+        const changePercent = (stock.changePercent || 0).toFixed(2)
+        const dayRange = ((stock.high || 0) - (stock.low || 0)).toFixed(2)
+        const rangePct = stock.previousClose > 0
+          ? (((stock.high || 0) - (stock.low || 0)) / stock.previousClose * 100).toFixed(2)
+          : 'N/A'
+        const volumeStr = (stock.volume || 0) > 10000
+          ? (stock.volume / 10000).toFixed(0) + '万'
+          : (stock.volume || 0) + '手'
 
-    const prompt = `你是一位顶级AI投顾分析师。请对以下A股/美股进行6维度风险扫描分析。
+        const prompt = `你是一位顶级AI投顾分析师。请对以下A股/美股进行6维度风险扫描分析。
 
 【股票数据】
 - 代码: ${stock.symbol}
@@ -759,35 +811,39 @@ app.post('/api/ai/health-check', async (req, res) => {
   "confidence": 数字
 }`
 
-    const response = await httpsPost(
-      'https://api.deepseek.com/v1/chat/completions',
-      {
-        model: 'deepseek-chat',
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.7,
-        max_tokens: 3000,
+        const response = await httpsPost(
+          'https://api.deepseek.com/v1/chat/completions',
+          {
+            model: 'deepseek-chat',
+            messages: [{ role: 'user', content: prompt }],
+            temperature: 0.7,
+            max_tokens: 3000,
+          },
+          { 'Authorization': `Bearer ${DEEPSEEK_API_KEY}` }
+        )
+
+        if (!response || !response.choices || response.choices.length === 0) {
+          throw new Error('AI 分析返回异常')
+        }
+
+        const content = response.choices[0].message.content
+        try {
+          return JSON.parse(content)
+        } catch {
+          throw new Error('AI 返回格式异常，请重试')
+        }
       },
-      { 'Authorization': `Bearer ${DEEPSEEK_API_KEY}` }
+      3600 // 缓存 1 小时
     )
 
-    if (!response || !response.choices || response.choices.length === 0) {
-      return res.json({ success: false, error: 'AI 分析返回异常' })
-    }
-
-    const content = response.choices[0].message.content
-    try {
-      const parsed = JSON.parse(content)
-      return res.json({ success: true, data: parsed })
-    } catch {
-      return res.json({ success: false, error: 'AI 返回格式异常，请重试' })
-    }
+    return res.json({ success: true, data: result })
   } catch (err) {
     console.error('AI健康检查失败:', err.message)
     res.status(500).json({ success: false, error: `AI分析失败: ${err.message}` })
   }
 })
 
-// AI 买卖信号分析
+// AI 买卖信号分析（缓存 1 小时，按 symbol + 参数去重）
 app.post('/api/ai/signal-analysis', async (req, res) => {
   try {
     const { stock, turnoverRate, dropFromHigh, marketDrop, isNewStock } = req.body
@@ -795,7 +851,10 @@ app.post('/api/ai/signal-analysis', async (req, res) => {
       return res.status(400).json({ success: false, error: '缺少股票数据' })
     }
 
-    const prompt = `你是一位顶级AI投顾，擅长技术面买卖信号分析。请根据以下数据给出专业的买卖信号研判。
+    const result = await getOrFetch(
+      `ai:signal:${stock.symbol}:${turnoverRate || 0}:${dropFromHigh || 0}:${marketDrop || 0}:${isNewStock ? 1 : 0}`,
+      async () => {
+        const prompt = `你是一位顶级AI投顾，擅长技术面买卖信号分析。请根据以下数据给出专业的买卖信号研判。
 
 【股票信息】
 - 代码: ${stock.symbol} ${stock.name || ''}
@@ -839,63 +898,69 @@ ${marketDrop != null ? `- 大盘从高点跌幅: ${marketDrop}%` : '- 大盘跌�
   "riskLevel": "low/medium/high"
 }`
 
-    const response = await httpsPost(
-      'https://api.deepseek.com/v1/chat/completions',
-      {
-        model: 'deepseek-chat',
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.7,
-        max_tokens: 2000,
+        const response = await httpsPost(
+          'https://api.deepseek.com/v1/chat/completions',
+          {
+            model: 'deepseek-chat',
+            messages: [{ role: 'user', content: prompt }],
+            temperature: 0.7,
+            max_tokens: 2000,
+          },
+          { 'Authorization': `Bearer ${DEEPSEEK_API_KEY}` }
+        )
+
+        if (!response || !response.choices || response.choices.length === 0) {
+          throw new Error('AI 分析返回异常')
+        }
+
+        const content = response.choices[0].message.content
+        try {
+          return JSON.parse(content)
+        } catch {
+          throw new Error('AI 返回格式异常，请重试')
+        }
       },
-      { 'Authorization': `Bearer ${DEEPSEEK_API_KEY}` }
+      3600 // 缓存 1 小时
     )
 
-    if (!response || !response.choices || response.choices.length === 0) {
-      return res.json({ success: false, error: 'AI 分析返回异常' })
-    }
-
-    const content = response.choices[0].message.content
-    try {
-      const parsed = JSON.parse(content)
-      return res.json({ success: true, data: parsed })
-    } catch {
-      return res.json({ success: false, error: 'AI 返回格式异常，请重试' })
-    }
+    return res.json({ success: true, data: result })
   } catch (err) {
     console.error('AI信号分析失败:', err.message)
     res.status(500).json({ success: false, error: `AI分析失败: ${err.message}` })
   }
 })
 
+// AI 涨停情绪分析（缓存 1 小时）
 app.get('/api/limit-up/analysis', async (req, res) => {
   try {
-    // 获取当天涨停数据
-    let stocks = []
-    try {
-      stocks = await getTodayLimitUp()
-    } catch { /* ignore */ }
-
-    if (stocks.length === 0) {
+    const result = await getOrFetch('ai:limitup:analysis', async () => {
+      // 获取当天涨停数据
+      let stocks = []
       try {
-        const today = new Date().toISOString().slice(0, 10)
-        stocks = await getLimitUpByDate(today)
+        stocks = await getTodayLimitUp()
       } catch { /* ignore */ }
-    }
 
-    if (stocks.length === 0) {
-      return res.json({ success: false, error: '暂无涨停数据，无法进行分析' })
-    }
+      if (stocks.length === 0) {
+        try {
+          const today = new Date().toISOString().slice(0, 10)
+          stocks = await getLimitUpByDate(today)
+        } catch { /* ignore */ }
+      }
 
-    // 汇总信息
-    const lowPrice = stocks.filter(s => s.price < 10)
-    const midPrice = stocks.filter(s => s.price >= 10 && s.price < 30)
-    const highPrice = stocks.filter(s => s.price >= 30)
+      if (stocks.length === 0) {
+        return null // null 不缓存，下次继续尝试
+      }
 
-    const topStocks = stocks.slice(0, 30).map((s, i) =>
-      `${i+1}. ${s.name}(${s.symbol}) 涨幅${s.change_percent}% 价格${s.price}元 换手${s.turnover_rate}%`
-    ).join('\n')
+      // 汇总信息
+      const lowPrice = stocks.filter(s => s.price < 10)
+      const midPrice = stocks.filter(s => s.price >= 10 && s.price < 30)
+      const highPrice = stocks.filter(s => s.price >= 30)
 
-    const prompt = `你是一位A股资深市场分析师。请对今天A股涨停情况进行专业分析。
+      const topStocks = stocks.slice(0, 30).map((s, i) =>
+        `${i+1}. ${s.name}(${s.symbol}) 涨幅${s.change_percent}% 价格${s.price}元 换手${s.turnover_rate}%`
+      ).join('\n')
+
+      const prompt = `你是一位A股资深市场分析师。请对今天A股涨停情况进行专业分析。
 
 【今日涨停概况】
 - 涨停总数：${stocks.length}只
@@ -914,22 +979,28 @@ ${topStocks}
 
 请用中文回答，保持专业客观，控制在500字以内。`
 
-    const response = await httpsPost(
-      'https://api.deepseek.com/v1/chat/completions',
-      {
-        model: 'deepseek-chat',
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.7,
-        max_tokens: 1500,
-      },
-      { 'Authorization': `Bearer ${DEEPSEEK_API_KEY}` }
-    )
+      const response = await httpsPost(
+        'https://api.deepseek.com/v1/chat/completions',
+        {
+          model: 'deepseek-chat',
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0.7,
+          max_tokens: 1500,
+        },
+        { 'Authorization': `Bearer ${DEEPSEEK_API_KEY}` }
+      )
 
-    if (response.choices && response.choices.length > 0) {
-      const analysis = response.choices[0].message.content
-      return res.json({ success: true, data: analysis })
+      if (response.choices && response.choices.length > 0) {
+        return response.choices[0].message.content
+      }
+      throw new Error('DeepSeek API 返回异常')
+    }, 3600) // 缓存 1 小时
+
+    if (!result) {
+      return res.json({ success: false, error: '暂无涨停数据，无法进行分析' })
     }
-    res.json({ success: false, error: 'DeepSeek API 返回异常' })
+
+    return res.json({ success: true, data: result })
   } catch (err) {
     console.error('DeepSeek 分析失败:', err.message)
     res.status(500).json({ success: false, error: `AI分析失败: ${err.message}` })
@@ -1071,49 +1142,54 @@ async function getLimitUpByDate(dateStr) {
   return stocks
 }
 
+// 个股涨停历史检查（缓存 5 分钟）
 app.get('/api/limit-up/check/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params
-    const prefix = symbol.startsWith('6') ? 'sh' : 'sz'
-    const sinaSymbol = `${prefix}${symbol}`
 
-    const { ok, body } = await httpGet(
-      `https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=${sinaSymbol}&scale=240&ma=no&datalen=30`,
-      { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
-    )
-    if (!ok) return res.status(500).json({ success: false, error: '获取历史数据失败' })
+    const data = await getOrFetch(`limitup:check:${symbol}`, async () => {
+      const prefix = symbol.startsWith('6') ? 'sh' : 'sz'
+      const sinaSymbol = `${prefix}${symbol}`
 
-    let data
-    try { data = JSON.parse(body) } catch { data = [] }
-    if (!Array.isArray(data)) data = []
+      const { ok, body } = await httpGet(
+        `https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=${sinaSymbol}&scale=240&ma=no&datalen=30`,
+        { headers: { 'Referer': 'https://finance.sina.com.cn' }, encoding: 'gbk' }
+      )
+      if (!ok) throw new Error('获取历史数据失败')
 
-    const isChiNext = symbol.startsWith('3') || symbol.startsWith('30')
-    const isStar = symbol.startsWith('688')
-    const limitPercent = (isChiNext || isStar) ? 19.9 : 9.9
+      let data
+      try { data = JSON.parse(body) } catch { data = [] }
+      if (!Array.isArray(data)) data = []
 
-    const limitUpDays = []
-    for (const d of data) {
-      const open = parseFloat(d.open)
-      const close = parseFloat(d.close)
-      if (open > 0) {
-        const changePercent = ((close - open) / open) * 100
-        if (changePercent >= limitPercent) {
-          limitUpDays.push({
-            date: d.day, open, close,
-            changePercent: parseFloat(changePercent.toFixed(2)),
-            volume: parseFloat(d.volume),
-          })
+      const isChiNext = symbol.startsWith('3') || symbol.startsWith('30')
+      const isStar = symbol.startsWith('688')
+      const limitPercent = (isChiNext || isStar) ? 19.9 : 9.9
+
+      const limitUpDays = []
+      for (const d of data) {
+        const open = parseFloat(d.open)
+        const close = parseFloat(d.close)
+        if (open > 0) {
+          const changePercent = ((close - open) / open) * 100
+          if (changePercent >= limitPercent) {
+            limitUpDays.push({
+              date: d.day, open, close,
+              changePercent: parseFloat(changePercent.toFixed(2)),
+              volume: parseFloat(d.volume),
+            })
+          }
         }
       }
-    }
+
+      return { symbol, limitUpDays, limitPercent }
+    }, 300) // 缓存 5 分钟
 
     res.json({
       success: true,
       data: {
-        symbol, limitUpDays,
-        firstLimitUp: limitUpDays.length > 0 ? limitUpDays[0] : null,
-        totalLimitUp: limitUpDays.length,
-        limitPercent,
+        ...data,
+        firstLimitUp: data.limitUpDays.length > 0 ? data.limitUpDays[0] : null,
+        totalLimitUp: data.limitUpDays.length,
       },
     })
   } catch (err) {
@@ -1176,10 +1252,13 @@ const strategyRoutes = {
   'ma-bullish': '均线多头排列',
 }
 
+// 策略数据缓存 30 分钟（数据每日更新一次）
 for (const [key, name] of Object.entries(strategyRoutes)) {
   app.get(`/api/strategy/${key}`, async (req, res) => {
     try {
-      const result = await proxyToPython(`/api/strategy/${key}`, 120000)
+      const result = await getOrFetch(`express:strategy:${key}`, async () => {
+        return await proxyToPython(`/api/strategy/${key}`, 120000)
+      }, 1800) // 30 分钟缓存
       res.json(result)
     } catch (err) {
       console.error(`${name}策略失败:`, err.message)
@@ -1188,7 +1267,7 @@ for (const [key, name] of Object.entries(strategyRoutes)) {
   })
 }
 
-// 策略回测（代理到 Python 服务）
+// 策略回测（代理到 Python 服务，不缓存）
 app.post('/api/backtest', async (req, res) => {
   try {
     const result = await proxyToPython('/api/backtest', 'POST', req.body)
@@ -1209,6 +1288,10 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '../client/dist/index.html'))
 })
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
+  await Promise.all([
+    initCache(),
+    initDB(),
+  ])
   console.log(`服务器启动成功: http://localhost:${PORT}`)
 })

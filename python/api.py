@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-A股行情微服务 - SQLite 缓存 + AKShare 数据源
+A股行情微服务 - MySQL + Redis 缓存 + AKShare 数据源
+升级说明：由 SQLite 迁移到 MySQL，新增 Redis 缓存（2026-06-10）
 数据源：
 1. 新浪 Market_Center.getHQNodeData → 全A股实时行情
 2. AKShare stock_zt_pool_em → 涨停池
@@ -8,7 +9,6 @@ A股行情微服务 - SQLite 缓存 + AKShare 数据源
 """
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import sqlite3
 import os
 import time
 import json
@@ -16,6 +16,9 @@ import threading
 import urllib.request
 from datetime import datetime, timedelta
 
+import pymysql
+import pymysql.cursors
+import redis as redis_module
 import akshare as ak
 
 app = Flask(__name__)
@@ -23,7 +26,24 @@ CORS(app)
 
 # ==================== 配置 ====================
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stock_cache.db')
+DB_CONFIG = {
+    'host': os.environ.get('DB_HOST', '127.0.0.1'),
+    'port': int(os.environ.get('DB_PORT', '3306')),
+    'user': os.environ.get('DB_USER', 'stockuser'),
+    'password': os.environ.get('DB_PASSWORD', 'stock2024'),
+    'database': os.environ.get('DB_NAME', 'stock'),
+    'charset': 'utf8mb4',
+}
+
+REDIS_CONFIG = {
+    'host': os.environ.get('REDIS_HOST', '127.0.0.1'),
+    'port': int(os.environ.get('REDIS_PORT', '6379')),
+    'password': os.environ.get('REDIS_PASSWORD', None),
+    'decode_responses': True,
+    'socket_connect_timeout': 2,
+    'protocol': 2,  # RESP2 兼容旧版 Redis
+}
+
 MAX_PAGES = 30
 PAGE_SIZE = 80
 MAX_RESULTS = 30
@@ -41,8 +61,136 @@ _sync_status = {
     'financial_count': 0,
     'syncing': False,
     'message': '等待同步...',
+    'data_source': 'akshare + sina + mysql',
 }
 _sync_lock = threading.Lock()
+
+# ==================== Redis 缓存 ====================
+
+_REDIS_CLIENT = None
+
+
+def get_redis():
+    """获取 Redis 客户端（惰性初始化，自动降级）"""
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is None:
+        try:
+            _REDIS_CLIENT = redis_module.Redis(**REDIS_CONFIG)
+            _REDIS_CLIENT.ping()
+            print('[cache] Redis 连接成功')
+        except Exception as e:
+            print(f'[cache] Redis 不可用 ({e}), 使用内存降级')
+            _REDIS_CLIENT = False  # 标记为禁用
+    return _REDIS_CLIENT if _REDIS_CLIENT else None
+
+
+def get_or_fetch_cache(key, fetch_fn, ttl=1800):
+    """
+    Redis 缓存装饰器
+    类似 Express 端 cache.js 的 getOrFetch 模式
+    先读缓存，没有再执行 fetch_fn 并写入缓存
+    """
+    r = get_redis()
+    if r:
+        try:
+            cached = r.get(key)
+            if cached is not None:
+                return json.loads(cached)
+        except Exception as e:
+            print(f'[cache] 读缓存失败: {e}')
+
+    result = fetch_fn()
+
+    if r and result is not None:
+        try:
+            r.setex(key, ttl, json.dumps(result, ensure_ascii=False))
+        except Exception as e:
+            print(f'[cache] 写缓存失败: {e}')
+
+    return result
+
+
+def invalidate_cache(pattern):
+    """按模式清除缓存键"""
+    r = get_redis()
+    if r:
+        try:
+            keys = r.keys(pattern)
+            if keys:
+                r.delete(*keys)
+                print(f'[cache] 清除 {len(keys)} 个缓存键: {pattern}')
+        except Exception as e:
+            print(f'[cache] 清除缓存失败: {e}')
+
+
+# ==================== MySQL 数据库 ====================
+
+
+def get_db():
+    """获取 MySQL 数据库连接"""
+    conn = pymysql.connect(**DB_CONFIG, cursorclass=pymysql.cursors.DictCursor)
+    return conn
+
+
+def query(sql, params=None):
+    """查询多行，返回 dict 列表；失败时返回空列表"""
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cursor:
+            cursor.execute(sql, params or ())
+            return cursor.fetchall()
+    except Exception as e:
+        print(f'[db] 查询失败: {e}')
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def query_one(sql, params=None):
+    """查询单行，返回 dict 或 None"""
+    rows = query(sql, params)
+    return rows[0] if rows else None
+
+
+def execute(sql, params=None):
+    """执行写操作（INSERT/UPDATE/DELETE），返回影响行数"""
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cursor:
+            cursor.execute(sql, params or ())
+        conn.commit()
+        return conn.affected_rows()
+    except Exception as e:
+        print(f'[db] 执行失败: {e}')
+        if conn:
+            conn.rollback()
+        return 0
+    finally:
+        if conn:
+            conn.close()
+
+
+def execute_many(sql, params_list):
+    """批量执行写操作，返回总影响行数"""
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cursor:
+            cursor.executemany(sql, params_list)
+        conn.commit()
+        return conn.affected_rows()
+    except Exception as e:
+        print(f'[db] 批量执行失败: {e}')
+        if conn:
+            conn.rollback()
+        return 0
+    finally:
+        if conn:
+            conn.close()
+
 
 # ==================== 辅助函数 ====================
 
@@ -55,13 +203,6 @@ def safe_float(val, default=0.0):
         return float(val)
     except (ValueError, TypeError):
         return default
-
-
-def get_db():
-    """获取数据库连接"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 def http_get(url, timeout=15, encoding='utf-8', headers=None):
@@ -91,81 +232,28 @@ def update_sync_status(**kwargs):
         pass
 
 
-# ==================== SQLite 初始化 ====================
+# ==================== 数据库初始化 ====================
 
 
 def init_db():
-    """初始化数据库"""
+    """验证 MySQL 连接（表由 server/schema.sql 创建）"""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-
-        # 全A股行情表（每日更新）
-        c.execute('''CREATE TABLE IF NOT EXISTS stock_quote (
-            symbol TEXT PRIMARY KEY,
-            name TEXT,
-            price REAL,
-            change_percent REAL,
-            pe REAL,
-            pb REAL,
-            market_cap REAL,
-            turnover_rate REAL,
-            update_time TEXT
-        )''')
-
-        # 财务数据表（季度更新）
-        c.execute('''CREATE TABLE IF NOT EXISTS financial_data (
-            symbol TEXT PRIMARY KEY,
-            revenue REAL,
-            cost REAL,
-            net_profit REAL,
-            prev_net_profit REAL,
-            gp_margin REAL,
-            np_growth REAL,
-            update_time TEXT
-        )''')
-
-        # 涨停池表（每日更新）
-        c.execute('''CREATE TABLE IF NOT EXISTS limit_up_pool (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT,
-            symbol TEXT,
-            name TEXT,
-            price REAL,
-            change_percent REAL,
-            turnover_rate REAL,
-            limit_up_count INTEGER,
-            seal_amount REAL,
-            first_limit_time TEXT,
-            industry TEXT,
-            UNIQUE(date, symbol)
-        )''')
-
-        # 涨停统计表（板块统计）
-        c.execute('''CREATE TABLE IF NOT EXISTS limit_up_stats (
-            date TEXT PRIMARY KEY,
-            total_count INTEGER,
-            industry_stats TEXT
-        )''')
-
-        # 创建索引加速查询
-        c.execute('CREATE INDEX IF NOT EXISTS idx_limit_up_date ON limit_up_pool(date)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_limit_up_symbol ON limit_up_pool(symbol)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_quote_mktcap ON stock_quote(market_cap)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_quote_pe ON stock_quote(pe)')
-
-        conn.commit()
+        conn = get_db()
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT COUNT(*) as cnt FROM stock_quote')
         conn.close()
-        print('[db] 数据库初始化完成')
+        print('[db] MySQL 连接验证成功')
+        return True
     except Exception as e:
-        print(f'[db] 初始化失败: {e}')
+        print(f'[db] MySQL 初始化失败: {e}')
+        return False
 
 
 # ==================== 数据同步逻辑 ====================
 
 
 def sync_all_quotes():
-    """同步全A股行情到SQLite"""
+    """同步全A股行情到 MySQL"""
     try:
         update_sync_status(syncing=True, message='正在同步全A股行情...')
         stocks = []
@@ -194,8 +282,9 @@ def sync_all_quotes():
             return
 
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        conn = sqlite3.connect(DB_PATH)
         count = 0
+        batch = []
+
         for s in stocks:
             try:
                 price = safe_float(s.get('trade'))
@@ -208,17 +297,22 @@ def sync_all_quotes():
                 pb = safe_float(s.get('pb'))
                 market_cap = safe_float(s.get('mktcap'))
                 turnover_rate = safe_float(s.get('turnoverratio'))
-                conn.execute(
-                    'INSERT OR REPLACE INTO stock_quote '
-                    '(symbol, name, price, change_percent, pe, pb, market_cap, turnover_rate, update_time) '
-                    'VALUES (?,?,?,?,?,?,?,?,?)',
-                    (symbol, name, price, change_percent, pe, pb, market_cap, turnover_rate, now)
-                )
+                batch.append((symbol, name, price, change_percent, pe, pb, market_cap, turnover_rate, now))
                 count += 1
             except Exception:
                 continue
-        conn.commit()
-        conn.close()
+
+        if batch:
+            # 分批写入，每批 500 条
+            batch_size = 500
+            for i in range(0, len(batch), batch_size):
+                chunk = batch[i:i + batch_size]
+                execute_many(
+                    'REPLACE INTO stock_quote '
+                    '(symbol, name, price, change_percent, pe, pb, market_cap, turnover_rate, update_time) '
+                    'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)',
+                    chunk
+                )
 
         update_sync_status(
             quotes=True,
@@ -226,6 +320,8 @@ def sync_all_quotes():
             quotes_count=count,
             message=f'行情同步完成，共 {count} 只股票',
         )
+        # 清除策略缓存（数据更新了）
+        invalidate_cache('strategy:*')
         print(f'[sync] 行情同步完成，共 {count} 只股票')
     except Exception as e:
         print(f'[sync] 行情同步失败: {e}')
@@ -233,7 +329,7 @@ def sync_all_quotes():
 
 
 def sync_limit_up(date_str):
-    """同步某日涨停池到SQLite"""
+    """同步某日涨停池到 MySQL"""
     try:
         df = ak.stock_zt_pool_em(date=date_str)
         if df is None or df.empty:
@@ -241,8 +337,9 @@ def sync_limit_up(date_str):
             return 0
 
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        conn = sqlite3.connect(DB_PATH)
         count = 0
+        batch = []
+
         for _, row in df.iterrows():
             try:
                 symbol = str(row.get('代码', '')).strip()
@@ -255,37 +352,39 @@ def sync_limit_up(date_str):
                 first_limit_time = str(row.get('首次封板时间', '')).strip()
                 industry = str(row.get('所属行业', '')).strip()
 
-                conn.execute(
-                    'INSERT OR REPLACE INTO limit_up_pool '
-                    '(date, symbol, name, price, change_percent, turnover_rate, '
-                    'limit_up_count, seal_amount, first_limit_time, industry) '
-                    'VALUES (?,?,?,?,?,?,?,?,?,?)',
-                    (date_str, symbol, name, price, change_percent, turnover_rate,
-                     limit_up_count, seal_amount, first_limit_time, industry)
-                )
+                batch.append((date_str, symbol, name, price, change_percent, turnover_rate,
+                              limit_up_count, seal_amount, first_limit_time, industry))
                 count += 1
             except Exception:
                 continue
-        conn.commit()
+
+        if batch:
+            execute_many(
+                'REPLACE INTO limit_up_pool '
+                '(date, symbol, name, price, change_percent, turnover_rate, '
+                'limit_up_count, seal_amount, first_limit_time, industry) '
+                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
+                batch
+            )
 
         # 更新板块统计
-        rows = conn.execute(
+        rows = query(
             'SELECT industry, COUNT(*) as cnt, AVG(change_percent) as avg_change, '
             'SUM(seal_amount) as total_seal '
-            'FROM limit_up_pool WHERE date = ? GROUP BY industry ORDER BY cnt DESC',
+            'FROM limit_up_pool WHERE date = %s GROUP BY industry ORDER BY cnt DESC',
             (date_str,)
-        ).fetchall()
+        )
         industry_stats = json.dumps(
-            [{'industry': r[0], 'count': r[1], 'avg_change': round(r[2], 2), 'total_seal': r[3]}
-             for r in rows if r[0]],
+            [{'industry': r['industry'], 'count': r['cnt'],
+              'avg_change': round(r['avg_change'], 2) if r['avg_change'] else 0,
+              'total_seal': r['total_seal'] or 0}
+             for r in rows if r.get('industry')],
             ensure_ascii=False
         )
-        conn.execute(
-            'INSERT OR REPLACE INTO limit_up_stats (date, total_count, industry_stats) VALUES (?,?,?)',
+        execute(
+            'REPLACE INTO limit_up_stats (date, total_count, industry_stats) VALUES (%s, %s, %s)',
             (date_str, count, industry_stats)
         )
-        conn.commit()
-        conn.close()
 
         print(f'[sync] 涨停池 {date_str} 同步完成，共 {count} 条')
         return count
@@ -299,9 +398,9 @@ def sync_financial_batch(symbols):
     try:
         update_sync_status(message=f'正在同步财务数据 (0/{len(symbols)})...')
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        conn = sqlite3.connect(DB_PATH)
         count = 0
         total = len(symbols)
+        batch = []
 
         for i, code in enumerate(symbols):
             try:
@@ -322,12 +421,7 @@ def sync_financial_batch(symbols):
                 np_growth = (net_profit - prev_net_profit) / abs(prev_net_profit) * 100 \
                     if prev_net_profit != 0 else 0
 
-                conn.execute(
-                    'INSERT OR REPLACE INTO financial_data '
-                    '(symbol, revenue, cost, net_profit, prev_net_profit, gp_margin, np_growth, update_time) '
-                    'VALUES (?,?,?,?,?,?,?)',
-                    (code, revenue, cost, net_profit, prev_net_profit, gp_margin, np_growth, now)
-                )
+                batch.append((code, revenue, cost, net_profit, prev_net_profit, gp_margin, np_growth, now))
                 count += 1
 
                 if (i + 1) % 50 == 0:
@@ -336,8 +430,13 @@ def sync_financial_batch(symbols):
             except Exception:
                 continue
 
-        conn.commit()
-        conn.close()
+        if batch:
+            execute_many(
+                'REPLACE INTO financial_data '
+                '(symbol, revenue, cost, net_profit, prev_net_profit, gp_margin, np_growth, update_time) '
+                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
+                batch
+            )
 
         update_sync_status(
             financial=True,
@@ -383,12 +482,8 @@ def background_sync():
 
         # 3. 同步前200只股票的财务数据（按市值排序）
         try:
-            conn = sqlite3.connect(DB_PATH)
-            rows = conn.execute(
-                'SELECT symbol FROM stock_quote ORDER BY market_cap DESC LIMIT 200'
-            ).fetchall()
-            conn.close()
-            symbols = [r[0] for r in rows]
+            rows = query('SELECT symbol FROM stock_quote ORDER BY market_cap DESC LIMIT 200')
+            symbols = [r['symbol'] for r in rows]
             if symbols:
                 print(f'[sync] 同步 {len(symbols)} 只股票财务数据...')
                 sync_financial_batch(symbols)
@@ -478,18 +573,16 @@ def calc_limit_up_score(row):
 def get_industry_stats(date_str):
     """获取某日涨停板块统计"""
     try:
-        conn = get_db()
-        rows = conn.execute(
+        rows = query(
             'SELECT industry, COUNT(*) as cnt, '
             'AVG(change_percent) as avg_change, '
             'SUM(seal_amount) as total_seal '
             'FROM limit_up_pool '
-            'WHERE date = ? '
+            'WHERE date = %s '
             'GROUP BY industry '
             'ORDER BY cnt DESC',
             (date_str,)
-        ).fetchall()
-        conn.close()
+        )
         return [
             {
                 'industry': r['industry'],
@@ -497,14 +590,14 @@ def get_industry_stats(date_str):
                 'avg_change': round(r['avg_change'], 2) if r['avg_change'] else 0,
                 'total_seal': r['total_seal'] or 0,
             }
-            for r in rows if r['industry']
+            for r in rows if r.get('industry')
         ]
     except Exception as e:
         print(f'[stats] 获取板块统计失败: {e}')
         return []
 
 
-# ==================== 策略实现（全部走SQLite） ====================
+# ==================== 策略实现（MySQL 查询 + Redis 缓存） ====================
 
 
 def build_strategy_result(row, extra_fields=None):
@@ -531,50 +624,48 @@ def build_strategy_result(row, extra_fields=None):
         return None
 
 
+def _exec_strategy(sql, params, scorer):
+    """通用的策略执行模板"""
+    rows = query(sql, params)
+    results = []
+    for r in rows:
+        try:
+            d = dict(r)
+            d['score'] = scorer(d)
+            d.setdefault('roe', 0)
+            d.setdefault('np_growth', 0)
+            d.setdefault('gp_margin', 0)
+            result = build_strategy_result(d)
+            if result:
+                results.append(result)
+        except Exception:
+            continue
+    results.sort(key=lambda x: x['score'], reverse=True)
+    return results[:MAX_RESULTS]
+
+
 def strategy_conservative():
     """保守型策略（纯行情数据）
     条件: PE>0 且 PE<15, PB>0 且 PB<3, 市值>200亿
     评分：PE低(35) + PB低(30) + 市值大(35)
     """
-    try:
-        conn = get_db()
-        rows = conn.execute(
-            'SELECT * FROM stock_quote '
-            'WHERE pe > 0 AND pe < 15 AND pb > 0 AND pb < 3 AND market_cap > 200000 '
-            'ORDER BY pe ASC, market_cap DESC '
-            'LIMIT 100'
-        ).fetchall()
-        conn.close()
+    sql = (
+        'SELECT * FROM stock_quote '
+        'WHERE pe > 0 AND pe < 15 AND pb > 0 AND pb < 3 AND market_cap > 200000 '
+        'ORDER BY pe ASC, market_cap DESC '
+        'LIMIT 100'
+    )
 
-        results = []
-        for r in rows:
-            try:
-                pe = safe_float(r['pe'])
-                pb = safe_float(r['pb'])
-                mktcap = safe_float(r['market_cap'])
+    def scorer(r):
+        pe = safe_float(r['pe'])
+        pb = safe_float(r['pb'])
+        mktcap = safe_float(r['market_cap'])
+        pe_score = max(0, (15 - pe) / 15) * 35
+        pb_score = max(0, (3 - pb) / 3) * 30
+        cap_score = min(mktcap / 10000000, 1) * 35
+        return pe_score + pb_score + cap_score
 
-                pe_score = max(0, (15 - pe) / 15) * 35
-                pb_score = max(0, (3 - pb) / 3) * 30
-                cap_score = min(mktcap / 10000000, 1) * 35
-                score = pe_score + pb_score + cap_score
-
-                d = dict(r)
-                d['score'] = score
-                d['roe'] = 0
-                d['np_growth'] = 0
-                d['gp_margin'] = 0
-
-                result = build_strategy_result(d)
-                if result:
-                    results.append(result)
-            except Exception:
-                continue
-
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:MAX_RESULTS]
-    except Exception as e:
-        print(f'[strategy] conservative error: {e}')
-        return []
+    return _exec_strategy(sql, None, scorer)
 
 
 def strategy_garp():
@@ -582,47 +673,28 @@ def strategy_garp():
     条件: PE>0 且 PE<80, 市值>50亿, 换手率>0.5%, 净利润增速>15%, 毛利率>30%
     评分：PEG低(40) + 净利润增速高(30) + 毛利率高(30)
     """
-    try:
-        conn = get_db()
-        rows = conn.execute(
-            'SELECT q.*, f.gp_margin, f.np_growth '
-            'FROM stock_quote q '
-            'LEFT JOIN financial_data f ON q.symbol = f.symbol '
-            'WHERE q.pe > 0 AND q.pe < 80 AND q.market_cap > 50000 AND q.turnover_rate > 0.5 '
-            'AND f.np_growth > 15 AND f.gp_margin > 30 '
-            'ORDER BY (q.pe * 1.0 / MAX(f.np_growth, 1)) ASC '
-            'LIMIT 100'
-        ).fetchall()
-        conn.close()
+    sql = (
+        'SELECT q.*, f.gp_margin, f.np_growth '
+        'FROM stock_quote q '
+        'LEFT JOIN financial_data f ON q.symbol = f.symbol '
+        'WHERE q.pe > 0 AND q.pe < 80 AND q.market_cap > 50000 AND q.turnover_rate > 0.5 '
+        'AND f.np_growth > 15 AND f.gp_margin > 30 '
+        'ORDER BY (q.pe * 1.0 / GREATEST(f.np_growth, 1)) ASC '
+        'LIMIT 100'
+    )
 
-        results = []
-        for r in rows:
-            try:
-                pe = safe_float(r['pe'])
-                np_growth = safe_float(r['np_growth'])
-                gp_margin = safe_float(r['gp_margin'])
+    def scorer(r):
+        pe = safe_float(r['pe'])
+        np_growth = safe_float(r['np_growth'])
+        gp_margin = safe_float(r['gp_margin'])
 
-                peg = pe / max(np_growth, 1)
-                peg_score = max(0, (1.2 - peg) / 1.2) * 40 if peg < 1.2 else 0
-                growth_score = min(np_growth / 100, 1) * 30
-                margin_score = min(gp_margin / 80, 1) * 30
-                score = peg_score + growth_score + margin_score
+        peg = pe / max(np_growth, 1)
+        peg_score = max(0, (1.2 - peg) / 1.2) * 40 if peg < 1.2 else 0
+        growth_score = min(np_growth / 100, 1) * 30
+        margin_score = min(gp_margin / 80, 1) * 30
+        return peg_score + growth_score + margin_score
 
-                d = dict(r)
-                d['score'] = score
-                d['roe'] = 0
-
-                result = build_strategy_result(d)
-                if result:
-                    results.append(result)
-            except Exception:
-                continue
-
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:MAX_RESULTS]
-    except Exception as e:
-        print(f'[strategy] garp error: {e}')
-        return []
+    return _exec_strategy(sql, None, scorer)
 
 
 def strategy_momentum():
@@ -630,48 +702,29 @@ def strategy_momentum():
     条件: 换手率>3%且<25%, 市值>50亿, 净利润增速>50%
     评分：净利润增速(50) + 换手率适中(50)
     """
-    try:
-        conn = get_db()
-        rows = conn.execute(
-            'SELECT q.*, f.np_growth, f.gp_margin '
-            'FROM stock_quote q '
-            'LEFT JOIN financial_data f ON q.symbol = f.symbol '
-            'WHERE q.turnover_rate > 3 AND q.turnover_rate < 25 AND q.market_cap > 50000 '
-            'AND f.np_growth > 50 '
-            'ORDER BY f.np_growth DESC '
-            'LIMIT 100'
-        ).fetchall()
-        conn.close()
+    sql = (
+        'SELECT q.*, f.np_growth, f.gp_margin '
+        'FROM stock_quote q '
+        'LEFT JOIN financial_data f ON q.symbol = f.symbol '
+        'WHERE q.turnover_rate > 3 AND q.turnover_rate < 25 AND q.market_cap > 50000 '
+        'AND f.np_growth > 50 '
+        'ORDER BY f.np_growth DESC '
+        'LIMIT 100'
+    )
 
-        results = []
-        for r in rows:
-            try:
-                np_growth = safe_float(r['np_growth'])
-                turnover = safe_float(r['turnover_rate'])
+    def scorer(r):
+        np_growth = safe_float(r['np_growth'])
+        turnover = safe_float(r['turnover_rate'])
 
-                growth_score = min(np_growth / 200, 1) * 50
-                if 8 <= turnover <= 12:
-                    turnover_score = 50
-                else:
-                    dist = min(abs(turnover - 8), abs(turnover - 12))
-                    turnover_score = max(0, 50 - dist * 5)
-                score = growth_score + turnover_score
+        growth_score = min(np_growth / 200, 1) * 50
+        if 8 <= turnover <= 12:
+            turnover_score = 50
+        else:
+            dist = min(abs(turnover - 8), abs(turnover - 12))
+            turnover_score = max(0, 50 - dist * 5)
+        return growth_score + turnover_score
 
-                d = dict(r)
-                d['score'] = score
-                d['roe'] = 0
-
-                result = build_strategy_result(d)
-                if result:
-                    results.append(result)
-            except Exception:
-                continue
-
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:MAX_RESULTS]
-    except Exception as e:
-        print(f'[strategy] momentum error: {e}')
-        return []
+    return _exec_strategy(sql, None, scorer)
 
 
 def strategy_potential():
@@ -679,46 +732,27 @@ def strategy_potential():
     条件: 市值>100亿, PE>0且PE<100, 换手率>1%, 净利润增速>50%
     评分：净利润增速(50) + 毛利率(30) + 市值(20)
     """
-    try:
-        conn = get_db()
-        rows = conn.execute(
-            'SELECT q.*, f.np_growth, f.gp_margin '
-            'FROM stock_quote q '
-            'LEFT JOIN financial_data f ON q.symbol = f.symbol '
-            'WHERE q.market_cap > 100000 AND q.pe > 0 AND q.pe < 100 AND q.turnover_rate > 1 '
-            'AND f.np_growth > 50 '
-            'ORDER BY f.np_growth DESC, f.gp_margin DESC '
-            'LIMIT 100'
-        ).fetchall()
-        conn.close()
+    sql = (
+        'SELECT q.*, f.np_growth, f.gp_margin '
+        'FROM stock_quote q '
+        'LEFT JOIN financial_data f ON q.symbol = f.symbol '
+        'WHERE q.market_cap > 100000 AND q.pe > 0 AND q.pe < 100 AND q.turnover_rate > 1 '
+        'AND f.np_growth > 50 '
+        'ORDER BY f.np_growth DESC, f.gp_margin DESC '
+        'LIMIT 100'
+    )
 
-        results = []
-        for r in rows:
-            try:
-                np_growth = safe_float(r['np_growth'])
-                gp_margin = safe_float(r['gp_margin'])
-                mktcap = safe_float(r['market_cap'])
+    def scorer(r):
+        np_growth = safe_float(r['np_growth'])
+        gp_margin = safe_float(r['gp_margin'])
+        mktcap = safe_float(r['market_cap'])
 
-                growth_score = min(np_growth / 200, 1) * 50
-                margin_score = min(gp_margin / 60, 1) * 30
-                cap_score = min(mktcap / 10000000, 1) * 20
-                score = growth_score + margin_score + cap_score
+        growth_score = min(np_growth / 200, 1) * 50
+        margin_score = min(gp_margin / 60, 1) * 30
+        cap_score = min(mktcap / 10000000, 1) * 20
+        return growth_score + margin_score + cap_score
 
-                d = dict(r)
-                d['score'] = score
-                d['roe'] = 0
-
-                result = build_strategy_result(d)
-                if result:
-                    results.append(result)
-            except Exception:
-                continue
-
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:MAX_RESULTS]
-    except Exception as e:
-        print(f'[strategy] potential error: {e}')
-        return []
+    return _exec_strategy(sql, None, scorer)
 
 
 def strategy_limitback():
@@ -726,52 +760,33 @@ def strategy_limitback():
     条件: 最近7天有涨停, 今日涨幅<5%（回调中）, 换手率>2%, 市值>50亿
     评分：涨停天数(40) + 换手率(30) + 净利润增速(30)
     """
-    try:
-        conn = get_db()
-        rows = conn.execute(
-            'SELECT DISTINCT q.symbol, q.name, q.price, q.change_percent, q.pe, q.pb, '
-            'q.market_cap, q.turnover_rate, f.np_growth, f.gp_margin, '
-            'COUNT(DISTINCT l.date) as limit_days '
-            'FROM stock_quote q '
-            'JOIN limit_up_pool l ON q.symbol = l.symbol '
-            'LEFT JOIN financial_data f ON q.symbol = f.symbol '
-            'WHERE l.date >= date("now", "-7 days") '
-            'AND q.change_percent < 5 '
-            'AND q.turnover_rate > 2 '
-            'AND q.market_cap > 50000 '
-            'GROUP BY q.symbol '
-            'ORDER BY limit_days DESC, q.turnover_rate DESC '
-            'LIMIT 100'
-        ).fetchall()
-        conn.close()
+    sql = (
+        'SELECT DISTINCT q.symbol, q.name, q.price, q.change_percent, q.pe, q.pb, '
+        'q.market_cap, q.turnover_rate, f.np_growth, f.gp_margin, '
+        'COUNT(DISTINCT l.date) as limit_days '
+        'FROM stock_quote q '
+        'JOIN limit_up_pool l ON q.symbol = l.symbol '
+        'LEFT JOIN financial_data f ON q.symbol = f.symbol '
+        'WHERE l.date >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 7 DAY), "%%Y%%m%%d") '
+        'AND q.change_percent < 5 '
+        'AND q.turnover_rate > 2 '
+        'AND q.market_cap > 50000 '
+        'GROUP BY q.symbol '
+        'ORDER BY limit_days DESC, q.turnover_rate DESC '
+        'LIMIT 100'
+    )
 
-        results = []
-        for r in rows:
-            try:
-                limit_days = safe_float(r['limit_days'])
-                turnover = safe_float(r['turnover_rate'])
-                np_growth = safe_float(r['np_growth'])
+    def scorer(r):
+        limit_days = safe_float(r['limit_days'])
+        turnover = safe_float(r['turnover_rate'])
+        np_growth = safe_float(r['np_growth'])
 
-                days_score = min(limit_days / 5, 1) * 40
-                turnover_score = min(turnover / 15, 1) * 30
-                growth_score = min(np_growth / 100, 1) * 30
-                score = days_score + turnover_score + growth_score
+        days_score = min(limit_days / 5, 1) * 40
+        turnover_score = min(turnover / 15, 1) * 30
+        growth_score = min(np_growth / 100, 1) * 30
+        return days_score + turnover_score + growth_score
 
-                d = dict(r)
-                d['score'] = score
-                d['roe'] = 0
-
-                result = build_strategy_result(d)
-                if result:
-                    results.append(result)
-            except Exception:
-                continue
-
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:MAX_RESULTS]
-    except Exception as e:
-        print(f'[strategy] limitback error: {e}')
-        return []
+    return _exec_strategy(sql, None, scorer)
 
 
 def strategy_ma_bullish():
@@ -779,46 +794,45 @@ def strategy_ma_bullish():
     条件: 涨跌幅>0, 换手率>1%, 市值>50亿, PE>0且PE<50
     评分：涨跌幅(40) + 换手率(30) + 市值(30)
     """
-    try:
-        conn = get_db()
-        rows = conn.execute(
-            'SELECT * FROM stock_quote '
-            'WHERE change_percent > 0 AND turnover_rate > 1 AND market_cap > 50000 '
-            'AND pe > 0 AND pe < 50 '
-            'ORDER BY change_percent DESC '
-            'LIMIT 100'
-        ).fetchall()
-        conn.close()
+    sql = (
+        'SELECT * FROM stock_quote '
+        'WHERE change_percent > 0 AND turnover_rate > 1 AND market_cap > 50000 '
+        'AND pe > 0 AND pe < 50 '
+        'ORDER BY change_percent DESC '
+        'LIMIT 100'
+    )
 
-        results = []
-        for r in rows:
-            try:
-                change = safe_float(r['change_percent'])
-                turnover = safe_float(r['turnover_rate'])
-                mktcap = safe_float(r['market_cap'])
+    def scorer(r):
+        change = safe_float(r['change_percent'])
+        turnover = safe_float(r['turnover_rate'])
+        mktcap = safe_float(r['market_cap'])
 
-                change_score = min(change / 10, 1) * 40
-                turnover_score = min(turnover / 10, 1) * 30
-                cap_score = min(mktcap / 5000000, 1) * 30
-                score = change_score + turnover_score + cap_score
+        change_score = min(change / 10, 1) * 40
+        turnover_score = min(turnover / 10, 1) * 30
+        cap_score = min(mktcap / 5000000, 1) * 30
+        return change_score + turnover_score + cap_score
 
-                d = dict(r)
-                d['score'] = score
-                d['roe'] = 0
-                d['np_growth'] = 0
-                d['gp_margin'] = 0
+    return _exec_strategy(sql, None, scorer)
 
-                result = build_strategy_result(d)
-                if result:
-                    results.append(result)
-            except Exception:
-                continue
 
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:MAX_RESULTS]
-    except Exception as e:
-        print(f'[strategy] ma-bullish error: {e}')
-        return []
+def get_cached_strategy(name):
+    """带 Redis 缓存的策略查询"""
+    cache_key = f'python:strategy:{name}'
+
+    def fetch():
+        strategy_fn = STRATEGY_MAP.get(name)
+        if not strategy_fn:
+            return None
+        t0 = time.time()
+        results = strategy_fn()
+        elapsed = round(time.time() - t0, 3)
+        return {
+            'results': results,
+            'elapsed': elapsed,
+        }
+
+    data = get_or_fetch_cache(cache_key, fetch, ttl=1800)  # 30 分钟缓存
+    return data
 
 
 # 策略映射
@@ -837,15 +851,30 @@ STRATEGY_MAP = {
 
 @app.route('/api/health')
 def health():
-    """健康检查（显示同步状态）"""
+    """健康检查（显示同步状态 + 数据源）"""
     try:
         with _sync_lock:
             status = dict(_sync_status)
+        # 检测 MySQL 和 Redis
+        mysql_ok = False
+        redis_ok = False
+        try:
+            conn = get_db()
+            conn.ping()
+            conn.close()
+            mysql_ok = True
+        except Exception:
+            pass
+        r = get_redis()
+        redis_ok = r is not None
+
         return jsonify({
             'status': 'ok',
-            'data_source': 'sina + akshare + sqlite',
+            'data_source': 'akshare + sina + mysql + redis',
             'timestamp': time.time(),
             'sync': status,
+            'mysql': mysql_ok,
+            'redis': redis_ok,
         })
     except Exception as e:
         return jsonify({'status': 'error', 'error': str(e)}), 500
@@ -880,11 +909,7 @@ def trigger_sync_quotes():
 def trigger_sync_financial():
     """手动触发财务同步"""
     try:
-        conn = get_db()
-        rows = conn.execute(
-            'SELECT symbol FROM stock_quote ORDER BY market_cap DESC LIMIT 200'
-        ).fetchall()
-        conn.close()
+        rows = query('SELECT symbol FROM stock_quote ORDER BY market_cap DESC LIMIT 200')
         symbols = [r['symbol'] for r in rows]
         if not symbols:
             return jsonify({'success': False, 'error': '无行情数据，请先同步行情'})
@@ -916,12 +941,10 @@ def limit_up_today():
     """今日涨停（含质量评分）"""
     try:
         today = datetime.now().strftime('%Y%m%d')
-        conn = get_db()
-        rows = conn.execute(
-            'SELECT * FROM limit_up_pool WHERE date = ? ORDER BY seal_amount DESC',
+        rows = query(
+            'SELECT * FROM limit_up_pool WHERE date = %s ORDER BY seal_amount DESC',
             (today,)
-        ).fetchall()
-        conn.close()
+        )
 
         results = []
         for r in rows:
@@ -967,12 +990,10 @@ def limit_up_history():
         if len(date_clean) != 8:
             return jsonify({'success': False, 'error': '日期格式应为 YYYY-MM-DD 或 YYYYMMDD'}), 400
 
-        conn = get_db()
-        rows = conn.execute(
-            'SELECT * FROM limit_up_pool WHERE date = ? ORDER BY seal_amount DESC',
+        rows = query(
+            'SELECT * FROM limit_up_pool WHERE date = %s ORDER BY seal_amount DESC',
             (date_clean,)
-        ).fetchall()
-        conn.close()
+        )
 
         results = []
         for r in rows:
@@ -1029,22 +1050,22 @@ def limit_up_stats():
 
 @app.route('/api/strategy/<name>')
 def get_strategy(name):
-    """策略选股接口"""
+    """策略选股接口（带 Redis 缓存）"""
     try:
         strategy_fn = STRATEGY_MAP.get(name)
         if not strategy_fn:
             return jsonify({'success': False, 'error': '未知策略: %s' % name}), 400
 
-        t0 = time.time()
-        results = strategy_fn()
-        elapsed = round(time.time() - t0, 3)
+        cached = get_cached_strategy(name)
+        if cached is None:
+            return jsonify({'success': False, 'error': '策略执行失败'}), 500
 
         return jsonify({
             'success': True,
             'strategy': name,
-            'count': len(results),
-            'data': results,
-            'elapsed': elapsed,
+            'count': len(cached['results']),
+            'data': cached['results'],
+            'elapsed': cached['elapsed'],
             'message': '',
         })
     except Exception as e:
@@ -1074,8 +1095,9 @@ def run_backtest():
         if not strategy_fn:
             return jsonify({'success': False, 'error': '未知策略: %s' % strategy}), 400
 
-        # 获取策略选股结果
-        selected = strategy_fn()[:10]
+        # 获取策略选股结果（用缓存版本）
+        cached = get_cached_strategy(strategy)
+        selected = (cached['results'] if cached else strategy_fn())[:10]
 
         if not selected:
             return jsonify({
@@ -1173,14 +1195,15 @@ def run_backtest():
 # ==================== 启动 ====================
 
 if __name__ == '__main__':
-    # 初始化数据库
+    # 验证数据库连接
     init_db()
 
     # 启动后台同步线程
     threading.Thread(target=background_sync, daemon=True).start()
 
     print('A股行情 API: http://localhost:3081')
-    print('数据源: 新浪实时行情 + AKShare (涨停池/财务报表)')
-    print('缓存: SQLite (%s)' % DB_PATH)
+    print('数据源: AKShare + 新浪实时行情')
+    print('数据库: MySQL (stock)')
+    print('缓存: Redis (:6379) + 自动降级')
     print('[startup] 服务启动中...')
     app.run(host='0.0.0.0', port=3081, debug=False, threaded=True)

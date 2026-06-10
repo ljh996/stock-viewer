@@ -10,3 +10,7 @@ project.zip
 deploy_key
 deploy_key.pub
 local-config.ps1
+__pycache__/
+*.pyc
+stock_cache.db
+optimization-plan.md

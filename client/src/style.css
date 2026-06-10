@@ -120,6 +120,33 @@ body {
   background-clip: text;
 }
 
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.login-btn-header {
+  background: transparent;
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  padding: 4px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--text);
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+.login-btn-header:hover {
+  background: var(--hover-bg);
+  border-color: var(--primary);
+}
+.login-btn-header.logged-in {
+  border-color: var(--primary);
+  background: var(--primary-light);
+  font-weight: 500;
+}
+
 .header-badge {
   font-size: 10px;
   padding: 3px 10px;
